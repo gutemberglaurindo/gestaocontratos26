@@ -28,12 +28,6 @@ class PostgresCursorWrapper:
     def execute(self, sql, params=None):
         # Substituir placeholders de SQLite (?) por Postgres (%s)
         sql = sql.replace('?', '%s')
-
-    def executemany(self, sql, seq_of_parameters):
-        # Substituir placeholders de SQLite (?) por Postgres (%s)
-        sql = sql.replace('?', '%s')
-        self._cur.executemany(sql, seq_of_parameters)
-        return self
         
         # Para inserts (exceto na tabela users que não tem id), obter o ID inserido usando RETURNING id
         is_insert = sql.strip().upper().startswith("INSERT")
@@ -53,6 +47,12 @@ class PostgresCursorWrapper:
                     self.lastrowid = row[0]
             except Exception:
                 pass
+        return self
+
+    def executemany(self, sql, seq_of_parameters):
+        # Substituir placeholders de SQLite (?) por Postgres (%s)
+        sql = sql.replace('?', '%s')
+        self._cur.executemany(sql, seq_of_parameters)
         return self
 
     def fetchone(self):
