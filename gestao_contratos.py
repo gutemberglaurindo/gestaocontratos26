@@ -1,25 +1,106 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import os
 from datetime import datetime, date
 
 # Configuração da página do Streamlit
 st.set_page_config(
-    page_title="Gestão de Contratos de Obras - Espírito Santo",
+    page_title="Gestão de contratos",
     page_icon="🏢",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-DB_PATH = "gestao_contratos.db"
 
-# Função para conectar ao banco de dados SQLite
+import psycopg2
+import psycopg2.extras
+
+class PostgresCursorWrapper:
+    def __init__(self, cur):
+        self._cur = cur
+        self.lastrowid = None
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+    def execute(self, sql, params=None):
+        # Substituir placeholders de SQLite (?) por Postgres (%s)
+        sql = sql.replace('?', '%s')
+        
+        # Para inserts (exceto na tabela users que não tem id), obter o ID inserido usando RETURNING id
+        is_insert = sql.strip().upper().startswith("INSERT")
+        is_users_insert = "INTO USERS" in sql.strip().upper()
+        if is_insert and not is_users_insert and "RETURNING" not in sql.upper():
+            sql = sql.rstrip().rstrip(';') + " RETURNING id"
+            
+        if params is not None:
+            self._cur.execute(sql, params)
+        else:
+            self._cur.execute(sql)
+            
+        if is_insert and not is_users_insert:
+            try:
+                row = self._cur.fetchone()
+                if row:
+                    self.lastrowid = row[0]
+            except Exception:
+                pass
+        return self
+
+    def fetchone(self):
+        try:
+            return self._cur.fetchone()
+        except Exception:
+            return None
+
+    def fetchall(self):
+        try:
+            return self._cur.fetchall()
+        except Exception:
+            return []
+
+    def __iter__(self):
+        return iter(self._cur)
+
+class PostgresConnectionWrapper:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return PostgresCursorWrapper(self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor))
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def execute(self, sql, params=None):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+# Função para conectar ao banco de dados PostgreSQL (Supabase)
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+    # Tenta obter a URL de conexão do Streamlit Secrets ou de variáveis de ambiente
+    db_url = None
+    if "postgres" in st.secrets:
+        db_url = st.secrets["postgres"].get("url") or st.secrets["postgres"].get("pg_url")
+    if not db_url:
+        db_url = os.environ.get("DATABASE_URL")
+    
+    if not db_url:
+        st.error("🚨 DATABASE_URL não configurada! Adicione a URL do Postgres nas configurações de Secrets do Streamlit (postgres.url).")
+        st.stop()
+    
+    conn = psycopg2.connect(db_url)
+    return PostgresConnectionWrapper(conn)
+
 
 # Inicialização e Seeding Automático do Banco de Dados
 def init_db():
@@ -39,7 +120,7 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contracts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_number TEXT NOT NULL,
         school_name TEXT NOT NULL,
         city TEXT NOT NULL,
@@ -48,9 +129,9 @@ def init_db():
         company_name TEXT NOT NULL,
         company_cnpj TEXT,
         contract_company_id TEXT,
-        value_initial REAL NOT NULL,
-        value_offered REAL NOT NULL,
-        value_base_bidding REAL,
+        value_initial DOUBLE PRECISION NOT NULL,
+        value_offered DOUBLE PRECISION NOT NULL,
+        value_base_bidding DOUBLE PRECISION,
         date_base TEXT,
         start_date TEXT,
         end_date TEXT,
@@ -69,7 +150,7 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_roles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_id INTEGER,
         username TEXT,
         role_type TEXT NOT NULL, -- 'Gestor', 'Fiscal', 'Apoio'
@@ -84,13 +165,13 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_measurements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_id INTEGER,
         measurement_num INTEGER,
         date TEXT,
-        value REAL,
-        value_reajuste REAL,
-        balance REAL,
+        value DOUBLE PRECISION,
+        value_reajuste DOUBLE PRECISION,
+        balance DOUBLE PRECISION,
         obs TEXT,
         FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
     );
@@ -98,9 +179,9 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_additives (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_id INTEGER,
-        value REAL,
+        value DOUBLE PRECISION,
         date TEXT,
         prazo_dias INTEGER,
         obs TEXT,
@@ -110,11 +191,11 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_reajustes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_id INTEGER,
         num_reajuste TEXT,
-        index_val REAL,
-        value REAL,
+        index_val DOUBLE PRECISION,
+        value DOUBLE PRECISION,
         obs TEXT,
         FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
     );
@@ -122,7 +203,7 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_id INTEGER,
         task_desc TEXT NOT NULL,
         due_date TEXT,
@@ -135,7 +216,7 @@ def init_db():
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         contract_id INTEGER,
         field_name TEXT NOT NULL,
         old_value TEXT,
@@ -580,14 +661,14 @@ def register_user(username, password, role, pref_area, email):
         conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?)", (username, password, role, pref_area, email))
         conn.commit()
         st.success("Usuário cadastrado com sucesso! Faça o login.")
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         st.error("Nome de usuário já existe.")
     finally:
         conn.close()
 
 # --- TELA DE LOGIN / SIGNUP ---
 if st.session_state['user'] is None:
-    st.title("🏢 Gestão de Contratos de Obras do Espírito Santo")
+    st.title("🏢 Gestão de contratos")
     st.caption("Auxílio a Gestores e Fiscais de Contratos - LEI 14.133/2021 e Decreto Estadual 5545-R/2023 (ES)")
     
     login_tab, register_tab = st.tabs(["🔐 Entrar", "📝 Cadastrar"])
@@ -892,20 +973,31 @@ if st.session_state['user'] is not None:
         else:
             c_options = {f"{r['contract_number']} - {r['school_name']}": r['id'] for r in all_c}
             
-            # Verificar se já veio do alerta de redirecionamento
-            default_index = 0
+            # Inicializar o estado de persistência do contrato selecionado se não existir
+            if 'persisted_contract_id' not in st.session_state:
+                st.session_state['persisted_contract_id'] = list(c_options.values())[0]
+            
+            # Se vier de um redirecionamento de alerta, atualiza o contrato persistido
             if st.session_state['selected_contract_id'] is not None:
-                # Encontrar index do ID
-                for i, (k, v) in enumerate(c_options.items()):
-                    if v == st.session_state['selected_contract_id']:
-                        default_index = i
-                        break
+                st.session_state['persisted_contract_id'] = st.session_state['selected_contract_id']
+                st.session_state['selected_contract_id'] = None  # Limpar o estado temporário do alerta
             
-            selected_contract_label = st.selectbox("Selecione o Contrato para detalhamento:", list(c_options.keys()), index=default_index)
+            # Encontrar o índice correto do contrato persistido na lista de opções
+            try:
+                selected_idx = list(c_options.values()).index(st.session_state['persisted_contract_id'])
+            except ValueError:
+                selected_idx = 0
+                
+            selected_contract_label = st.selectbox(
+                "Selecione o Contrato para detalhamento:", 
+                list(c_options.keys()), 
+                index=selected_idx,
+                key="contract_selectbox_widget"
+            )
+            
+            # Atualizar o ID persistido com base na seleção atual do selectbox
             selected_contract_id = c_options[selected_contract_label]
-            
-            # Resetar a seleção temporária para não prender a tela
-            st.session_state['selected_contract_id'] = None
+            st.session_state['persisted_contract_id'] = selected_contract_id
             
             # Carregar dados do contrato selecionado
             conn = get_db_connection()
@@ -1011,7 +1103,7 @@ if st.session_state['user'] is not None:
                             "EXCLUIR (Apagar dado permanentemente)"
                         ])
                         
-                        st.warning("⚠️ Operações de SUBSTITUIR e EXCLUIR apagam permanentemente os dados antigos do registro de auditoria do campo!")
+                        st.error("⚠️ ATENÇÃO: Caso selecione SUBSTITUIR ou EXCLUIR, **OS DADOS ANTIGOS SERÃO PERDIDOS PERMANENTEMENTE!**")
                         confirm_pass = st.text_input("Digite sua senha para confirmar a alteração:", type="password")
                         
                         cancel_btn = st.form_submit_button("Cancelar")
@@ -1030,14 +1122,25 @@ if st.session_state['user'] is not None:
                             if not confirm_pass or u_chk['password'] != confirm_pass:
                                 st.error("Senha de confirmação inválida!")
                             else:
-                                new_val_str = str(new_val) if action_type != "EXCLUIR (Apagar dado permanentemente)" else ""
                                 mod_type = "MODIFICAR" if "MODIFICAR" in action_type else ("SUBSTITUIR" if "SUBSTITUIR" in action_type else "EXCLUIR")
+                                
+                                # Definir o valor correto para salvar no banco
+                                if mod_type == "EXCLUIR":
+                                    new_db_val = None if f_type != "number" else 0.0
+                                    new_val_str = ""
+                                else:
+                                    new_db_val = new_val
+                                    new_val_str = str(new_val)
                                 
                                 # Efetuar update no banco
                                 conn = get_db_connection()
-                                conn.execute(f"UPDATE contracts SET {db_field} = ? WHERE id = ?", (new_val_str, selected_contract_id))
+                                conn.execute(f"UPDATE contracts SET {db_field} = ? WHERE id = ?", (new_db_val, selected_contract_id))
                                 
-                                # Salvar no histórico
+                                # Se for SUBSTITUIR ou EXCLUIR, apagar histórico antigo desse campo para este contrato
+                                if mod_type in ["SUBSTITUIR", "EXCLUIR"]:
+                                    conn.execute("DELETE FROM contract_history WHERE contract_id = ? AND field_name = ?", (selected_contract_id, db_field))
+                                
+                                # Salvar no histórico de auditoria
                                 conn.execute("""
                                     INSERT INTO contract_history (contract_id, field_name, old_value, new_value, modified_by, modified_at, modification_type, initial_date)
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
