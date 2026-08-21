@@ -28,6 +28,12 @@ class PostgresCursorWrapper:
     def execute(self, sql, params=None):
         # Substituir placeholders de SQLite (?) por Postgres (%s)
         sql = sql.replace('?', '%s')
+
+    def executemany(self, sql, seq_of_parameters):
+        # Substituir placeholders de SQLite (?) por Postgres (%s)
+        sql = sql.replace('?', '%s')
+        self._cur.executemany(sql, seq_of_parameters)
+        return self
         
         # Para inserts (exceto na tabela users que não tem id), obter o ID inserido usando RETURNING id
         is_insert = sql.strip().upper().startswith("INSERT")
@@ -238,7 +244,7 @@ def init_db():
             ('gestor_es', 'Gestor@123', 'CREATOR', 'Engenharia Civil', 'gestor@es.gov.br'),
             ('fiscal_es', 'Fiscal@123', 'PARTICIPANT', 'Engenharia Civil', 'fiscal@es.gov.br')
         ]
-        cursor.executemany("INSERT INTO users VALUES (?, ?, ?, ?, ?)", default_users)
+        cursor.executemany("INSERT INTO users VALUES (%s, %s, %s, %s, %s)", default_users)
         
     # Seed default contracts from ES sources
     cursor.execute("SELECT COUNT(*) FROM contracts")
