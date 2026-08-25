@@ -109,6 +109,7 @@ def get_db_connection():
 
 
 # Inicialização e Seeding Automático do Banco de Dados
+# Inicialização e Seeding Automático do Banco de Dados
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -119,7 +120,7 @@ def init_db():
         username TEXT PRIMARY KEY,
         password TEXT NOT NULL,
         role TEXT NOT NULL, -- 'DEVELOPER', 'CREATOR', 'PARTICIPANT'
-        pref_area TEXT NOT NULL, -- 'Engenharia Civil', 'Engenharia Elétrica', etc.
+        pref_area TEXT NOT NULL, -- 'Engenharia Civil', 'Engenharia Elétrica', etc.,
         email TEXT NOT NULL
     );
     ''')
@@ -150,10 +151,34 @@ def init_db():
         rico_obs TEXT,
         created_by TEXT,
         delegated_to TEXT,
+        due_date TEXT, -- Data de Prazo
         FOREIGN KEY (created_by) REFERENCES users(username)
     );
     ''')
     
+    # Executar migração caso a coluna due_date ou tabelas novas não existam no Supabase já populado
+    try:
+        cursor.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS due_date TEXT;")
+    except Exception:
+        pass
+        
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS custom_field_labels (
+        column_name TEXT PRIMARY KEY,
+        label TEXT NOT NULL
+    );
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS dismissed_notifications (
+        id SERIAL PRIMARY KEY,
+        contract_id INTEGER,
+        alert_key TEXT NOT NULL,
+        dismissed_by TEXT,
+        dismissed_at TEXT,
+        FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+    );
+    ''')
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS contract_roles (
         id SERIAL PRIMARY KEY,
@@ -599,9 +624,52 @@ def init_db():
                 VALUES (?, ?, ?, ?, ?)
                 ''', (contract_id, t[0], t[1], t[2], "gestor_es"))
                 
+    
+    # Seed EEEM Arnulpho Mattos se não existir
+    cursor.execute("SELECT COUNT(*) FROM contracts WHERE school_name = 'EEEM Arnulpho Mattos'")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+        INSERT INTO contracts (
+            contract_number, school_name, city, processo_mae, processo_pagamento, 
+            company_name, company_cnpj, contract_company_id, value_initial, value_offered, 
+            value_base_bidding, date_base, start_date, end_date, warranty_type, 
+            os_date, os_obs, rao_date, rao_obs, rico_date, rico_obs, created_by, delegated_to, due_date
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (
+            "015/2025", "EEEM Arnulpho Mattos", "Vitória", "2024-VX751", "2025-F9JQG",
+            "AMF ENGENHARIA E SERVIÇOS LTDA", "08.123.456/0001-90", "2025.000015.42101.01",
+            9582872.37, 9582872.37, 0.0, "JUNHO/2024", "25/03/2025", "21/05/2028", "Seguro Garantia",
+            "", "", "11/09/2025", "RAO #323 / RICO #324", "", "", "gestor_es", "", ""
+        ))
+        c_id = cursor.lastrowid
+        if c_id:
+            cursor.execute('''
+            INSERT INTO contract_roles (contract_id, username, role_type, area, start_date, email, obs)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ''', (c_id, "Gestor #537", "Gestor", "Engenharia Civil", "20/05/2026", "gestor_es@es.gov.br", "Ativo de 20/05/2026 a XX/XX/XXXX"))
+            
+            cursor.execute('''
+            INSERT INTO contract_additives (contract_id, value, date, prazo_dias, obs)
+            VALUES (%s, %s, %s, %s, %s)
+            ''', (c_id, 144830.28, "11/09/2025", 0, "1º Aditivo #466 (Acréscimo R$ 149.867,01 (1,56%) / Decréscimo R$ 5.036,73)"))
+            
+            cursor.execute('''
+            INSERT INTO contract_reajustes (contract_id, num_reajuste, index_val, value, obs)
+            VALUES (%s, %s, %s, %s, %s)
+            ''', (c_id, "#64", 0.072113026, 691049.92, "Apostilamento Reajuste #64 (INCC – Coluna 35) R$691.049,92. Complementação Garantia em 34.552,49"))
+            
+            cursor.execute('''
+            INSERT INTO contract_measurements (contract_id, measurement_num, date, value, value_reajuste, balance, obs)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ''', (c_id, 11, "Março/2026", 177964.57, 12833.56, 0.0, "Medição #443, total R$ 190.798,13"))
+            
+            cursor.execute('''
+            INSERT INTO contract_measurements (contract_id, measurement_num, date, value, value_reajuste, balance, obs)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ''', (c_id, 12, "Abril/2026", 0.0, 0.0, 0.0, "12º Medição Em andamento"))
+    
     conn.commit()
     conn.close()
-
 # Executar inicialização do banco
 init_db()
 
@@ -631,6 +699,48 @@ if 'username' not in st.session_state:
     st.session_state['username'] = None
 if 'selected_contract_id' not in st.session_state:
     st.session_state['selected_contract_id'] = None
+
+
+def get_readjustment_alerts(c, today):
+    db_str = c.get('date_base')
+    if not db_str or 'os' in db_str.lower() or '/' not in db_str:
+        return []
+    months_map = {
+        "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+        "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+        "janei": 1, "fever": 2, "março": 3, "abril": 4, "maio": 5, "junho": 6,
+        "julho": 7, "agost": 8, "setem": 9, "outub": 10, "novem": 11, "dezem": 12
+    }
+    db_lower = db_str.lower().strip()
+    month_num = None
+    for k, v in months_map.items():
+        if k in db_lower:
+            month_num = v
+            break
+    if not month_num:
+        return []
+    
+    next_year = today.year
+    if today.month > month_num:
+        next_year += 1
+    try:
+        next_reajuste = date(next_year, month_num, 1)
+    except Exception:
+        return []
+    days_left = (next_reajuste - today).days
+    
+    if 0 < days_left <= 90:
+        return [{
+            "type": "warning" if days_left > 30 else "critical",
+            "priority": 2 if days_left > 30 else 1,
+            "days_left": days_left,
+            "due_date_str": next_reajuste.strftime("%d/%m/%Y"),
+            "title": f"📈 Reajuste Anual Próximo - {c['contract_number']}",
+            "text": f"O reajuste anual do contrato da escola **{c['school_name']}** (Data-Base: {db_str}) está próximo.",
+            "alert_key": f"reaj_alert_{c['id']}_{next_year}",
+            "contract_id": c['id']
+        }]
+    return []
 
 def check_password_strength(password):
     if len(password) < 4:
@@ -779,78 +889,253 @@ if st.session_state['user'] is not None:
         tasks = conn.execute("SELECT t.*, c.school_name FROM contract_tasks t JOIN contracts c ON t.contract_id = c.id WHERE t.status != 'Concluído'").fetchall()
         conn.close()
         
-        alerts = []
+                # Buscar alertas já encerrados (dismissed)
+        dismissed_res = conn.execute("SELECT contract_id, alert_key FROM dismissed_notifications").fetchall()
+        dismissed_set = {(r['contract_id'], r['alert_key']) for r in dismissed_res}
         
-        # Regra 1: Contratos próximos ao vencimento (menos de 90 dias)
+        alerts = []
+        today_val = date.today()
+        
+        # Regra 1: Contratos próximos ao vencimento ou vencidos
         for c in contracts:
-            if c['end_date'] and c['end_date'] != 'XX/ XX /20XX' and c['end_date'] != 'XX / XX /20XX':
+            if c['end_date'] and c['end_date'].strip() not in ['XX/ XX /20XX', 'XX / XX /20XX', '']:
                 try:
                     end_dt = datetime.strptime(c['end_date'].strip(), "%d/%m/%Y").date()
-                    days_left = (end_dt - date.today()).days
-                    if 0 <= days_left <= 90:
-                        alerts.append({
-                            "type": "critical",
-                            "title": f"Vencimento Contratual Próximo - {c['contract_number']}",
-                            "text": f"O contrato da escola **{c['school_name']}** expira em {days_left} dias ({c['end_date']}). Providenciar termo aditivo ou encerramento.",
-                            "contract_id": c['id']
-                        })
-                    elif days_left < 0:
-                        alerts.append({
-                            "type": "critical",
-                            "title": f"CONTRATO VENCIDO - {c['contract_number']}",
-                            "text": f"O prazo de vigência do contrato da escola **{c['school_name']}** encerrou em {c['end_date']}.",
-                            "contract_id": c['id']
-                        })
+                    days_left = (end_dt - today_val).days
+                    alert_key = f"end_date_{c['id']}"
+                    
+                    if (c['id'], alert_key) not in dismissed_set:
+                        if days_left <= 30:
+                            alerts.append({
+                                "type": "critical",
+                                "priority": 1,
+                                "days_left": days_left,
+                                "due_date_str": c['end_date'],
+                                "title": f"🚨 Contrato Vencido ou Próximo do Fim - {c['contract_number']}",
+                                "text": f"Vigência da escola **{c['school_name']}** encerra em {days_left} dias ({c['end_date']}). Providencie termo aditivo.",
+                                "alert_key": alert_key,
+                                "contract_id": c['id']
+                            })
+                        elif 30 < days_left <= 90:
+                            alerts.append({
+                                "type": "warning",
+                                "priority": 2,
+                                "days_left": days_left,
+                                "due_date_str": c['end_date'],
+                                "title": f"⚠️ Vencimento Contratual em Médio Prazo - {c['contract_number']}",
+                                "text": f"O contrato da escola **{c['school_name']}** expira em {days_left} dias ({c['end_date']}).",
+                                "alert_key": alert_key,
+                                "contract_id": c['id']
+                            })
+                        else:
+                            alerts.append({
+                                "type": "info",
+                                "priority": 3,
+                                "days_left": days_left,
+                                "due_date_str": c['end_date'],
+                                "title": f"ℹ️ Prazo de Vigência Confortável - {c['contract_number']}",
+                                "text": f"O contrato da escola **{c['school_name']}** tem vigência até {c['end_date']}.",
+                                "alert_key": alert_key,
+                                "contract_id": c['id']
+                            })
                 except ValueError:
                     pass
-                    
-            # Regra 2: Garantias sem registro ou em aguardo
-            if not c['warranty_type'] or "Aguardando" in c['warranty_type']:
-                alerts.append({
-                    "type": "warning",
-                    "title": f"Garantia Pendente - {c['contract_number']}",
-                    "text": f"O contrato da escola **{c['school_name']}** está sem comprovante de Seguro Garantia registrado ou aguardando confirmação.",
-                    "contract_id": c['id']
-                })
-                
-            # Regra 3: Reunião de Abertura de Obra (RAO) ou RICO não registradas
-            if not c['rao_date'] and not c['os_date']:
-                alerts.append({
-                    "type": "info",
-                    "title": f"Ordem de Serviço pendente - {c['contract_number']}",
-                    "text": f"Não há registro de Ordem de Serviço (OS) ou Reunião de Abertura (RAO) para a escola **{c['school_name']}**.",
-                    "contract_id": c['id']
-                })
-                
-        # Regra 4: Tarefas e Pendências em atraso
-        for t in tasks:
-            if t['due_date']:
+            
+            # Regra 1b: Data de Prazo do contrato (due_date) se houver
+            if c.get('due_date') and c['due_date'].strip() != '':
                 try:
-                    due_dt = datetime.strptime(t['due_date'], "%Y-%m-%d").date()
-                    if due_dt < date.today():
-                        alerts.append({
-                            "type": "warning",
-                            "title": f"Tarefa em Atraso - {t['school_name']}",
-                            "text": f"A pendência **'{t['task_desc']}'** deveria ter sido concluída em {due_dt.strftime('%d/%m/%Y')}.",
-                            "contract_id": t['contract_id']
-                        })
+                    due_dt = datetime.strptime(c['due_date'].strip(), "%d/%m/%Y").date()
+                    days_left = (due_dt - today_val).days
+                    alert_key = f"contract_due_{c['id']}"
+                    
+                    if (c['id'], alert_key) not in dismissed_set:
+                        if days_left <= 30:
+                            alerts.append({
+                                "type": "critical",
+                                "priority": 1,
+                                "days_left": days_left,
+                                "due_date_str": c['due_date'],
+                                "title": f"🚨 Prazo Limite Crítico - {c['contract_number']}",
+                                "text": f"O prazo final do contrato da escola **{c['school_name']}** expira em {days_left} dias ({c['due_date']}).",
+                                "alert_key": alert_key,
+                                "contract_id": c['id']
+                            })
+                        elif 30 < days_left <= 90:
+                            alerts.append({
+                                "type": "warning",
+                                "priority": 2,
+                                "days_left": days_left,
+                                "due_date_str": c['due_date'],
+                                "title": f"⚠️ Prazo Limite em Médio Prazo - {c['contract_number']}",
+                                "text": f"O contrato da escola **{c['school_name']}** tem prazo até {c['due_date']} ({days_left} dias).",
+                                "alert_key": alert_key,
+                                "contract_id": c['id']
+                            })
+                        else:
+                            alerts.append({
+                                "type": "info",
+                                "priority": 3,
+                                "days_left": days_left,
+                                "due_date_str": c['due_date'],
+                                "title": f"ℹ️ Prazo Limite Confortável - {c['contract_number']}",
+                                "text": f"O prazo limite do contrato é {c['due_date']}.",
+                                "alert_key": alert_key,
+                                "contract_id": c['id']
+                            })
                 except ValueError:
                     pass
 
+            # Regra 2: Garantias sem registro ou em aguardo
+            if (not c['warranty_type'] or "Aguardando" in c['warranty_type'] or c['warranty_type'].strip() == ""):
+                alert_key = "warranty_pending"
+                if (c['id'], alert_key) not in dismissed_set:
+                    alerts.append({
+                        "type": "warning",
+                        "priority": 2,
+                        "days_left": 45, # Prioridade média
+                        "due_date_str": "Imediato",
+                        "title": f"📋 Seguro Garantia Pendente - {c['contract_number']}",
+                        "text": f"A escola **{c['school_name']}** está sem comprovante de Seguro Garantia registrado ou aguardando confirmação.",
+                        "alert_key": alert_key,
+                        "contract_id": c['id']
+                    })
+                    
+            # Regra 3: Reunião de Abertura de Obra (RAO) ou RICO não registradas
+            if not c['rao_date'] and not c['os_date']:
+                alert_key = "os_rao_pending"
+                if (c['id'], alert_key) not in dismissed_set:
+                    alerts.append({
+                        "type": "info",
+                        "priority": 3,
+                        "days_left": 60,
+                        "due_date_str": "Pendente",
+                        "title": f" Ordem de Serviço / RAO Pendente - {c['contract_number']}",
+                        "text": f"Não há registro de Ordem de Serviço (OS) ou Reunião de Abertura (RAO) para a escola **{c['school_name']}**.",
+                        "alert_key": alert_key,
+                        "contract_id": c['id']
+                    })
+                    
+            # Regra 5: Reajuste Anual 3 meses antes
+            reaj_alerts = get_readjustment_alerts(c, today_val)
+            for ra in reaj_alerts:
+                if (c['id'], ra['alert_key']) not in dismissed_set:
+                    alerts.append(ra)
+                    
+        # Regra 4: Tarefas e Pendências em atraso / abertas (Atualização 9)
+        for t in tasks:
+            alert_key = f"task_{t['id']}"
+            if (t['contract_id'], alert_key) not in dismissed_set:
+                if t['due_date']:
+                    try:
+                        due_dt = datetime.strptime(t['due_date'].strip(), "%Y-%m-%d").date()
+                        days_left = (due_dt - today_val).days
+                        due_str = due_dt.strftime("%d/%m/%Y")
+                        
+                        if days_left <= 30:
+                            alerts.append({
+                                "type": "critical",
+                                "priority": 1,
+                                "days_left": days_left,
+                                "due_date_str": due_str,
+                                "title": f"🚨 Pendência Urgente - {t['school_name']}",
+                                "text": f"A pendência **'{t['task_desc']}'** expira em {days_left} dias ({due_str}).",
+                                "alert_key": alert_key,
+                                "contract_id": t['contract_id']
+                            })
+                        elif 30 < days_left <= 90:
+                            alerts.append({
+                                "type": "warning",
+                                "priority": 2,
+                                "days_left": days_left,
+                                "due_date_str": due_str,
+                                "title": f"⚠️ Pendência em Médio Prazo - {t['school_name']}",
+                                "text": f"A pendência **'{t['task_desc']}'** deve ser resolvida até {due_str}.",
+                                "alert_key": alert_key,
+                                "contract_id": t['contract_id']
+                            })
+                        else:
+                            alerts.append({
+                                "type": "info",
+                                "priority": 3,
+                                "days_left": days_left,
+                                "due_date_str": due_str,
+                                "title": f"ℹ️ Pendência sob Controle - {t['school_name']}",
+                                "text": f"Pendência ativa: **'{t['task_desc']}'** com prazo para {due_str}.",
+                                "alert_key": alert_key,
+                                "contract_id": t['contract_id']
+                            })
+                    except ValueError:
+                        alerts.append({
+                            "type": "info",
+                            "priority": 3,
+                            "days_left": 999,
+                            "due_date_str": "Sem Prazo",
+                            "title": f"ℹ️ Pendência Ativa - {t['school_name']}",
+                            "text": f"A pendência **'{t['task_desc']}'** está sem data limite definida.",
+                            "alert_key": alert_key,
+                            "contract_id": t['contract_id']
+                        })
+                else:
+                    alerts.append({
+                        "type": "info",
+                        "priority": 3,
+                        "days_left": 999,
+                        "due_date_str": "Sem Prazo",
+                        "title": f"ℹ️ Pendência Ativa - {t['school_name']}",
+                        "text": f"A pendência **'{t['task_desc']}'** está sem data limite definida.",
+                        "alert_key": alert_key,
+                        "contract_id": t['contract_id']
+                    })
+
+        # Ordenação de Alertas por Prioridade e Proximidade de Data (Atualização 2)
+        alerts.sort(key=lambda x: (x['priority'], x['days_left']))
+
         if alerts:
             for a in alerts:
-                card_class = f"card-{a['type']}"
+                text_color = "#ef4444" if a['type'] == "critical" else ("#f59e0b" if a['type'] == "warning" else "#0ea5e9")
                 st.markdown(f"""
-                <div class="{card_class}">
-                    <div class="card-title">{a['title']}</div>
-                    <div class="card-text">{a['text']}</div>
+                <div class="card-{a['type']}" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-radius: 8px;">
+                    <div style="flex-grow: 1;">
+                        <div class="card-title" style="margin-bottom: 3px;">{a['title']}</div>
+                        <div class="card-text">{a['text']}</div>
+                    </div>
+                    <div style="font-weight: bold; font-size: 15px; color: {text_color}; white-space: nowrap; margin-left: 15px; text-align: right;">
+                        📅 {a['due_date_str']}
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
-                if st.button("🔍 Acessar Contrato", key=f"alert_btn_{a['contract_id']}_{hash(a['title'])}"):
-                    st.session_state['selected_contract_id'] = a['contract_id']
-                    st.info(f"Direcionando para o contrato da escola... Por favor, selecione a aba 'Visualizar/Editar Contratos' na barra lateral.")
+                
+                col_acc, col_dms = st.columns([2, 1])
+                with col_acc:
+                    if st.button("🔍 Acessar Contrato", key=f"alert_btn_{a['contract_id']}_{hash(a['alert_key'])}"):
+                        st.session_state['selected_contract_id'] = a['contract_id']
+                        st.info(f"Direcionando para o contrato da escola... Por favor, selecione a aba 'Visualizar/Editar Contratos' na barra lateral.")
+                with col_dms:
+                    with st.expander("🔏 Encerrar Alerta"):
+                        dismiss_pass = st.text_input("Digite sua senha para encerrar:", type="password", key=f"pass_{hash(a['alert_key'])}")
+                        if st.button("Confirmar Encerramento", key=f"dms_btn_{hash(a['alert_key'])}"):
+                            conn = get_db_connection()
+                            u_chk = conn.execute("SELECT password FROM users WHERE username = %s", (current_user,)).fetchone()
+                            if u_chk and u_chk['password'] == dismiss_pass:
+                                conn.execute("""
+                                    INSERT INTO dismissed_notifications (contract_id, alert_key, dismissed_by, dismissed_at)
+                                    VALUES (%s, %s, %s, %s)
+                                """, (a['contract_id'], a['alert_key'], current_user, datetime.now().strftime("%d/%m/%Y %H:%M")))
+                                
+                                # Se o alerta era vinculado a uma tarefa/pendência, encerrá-la também (Atualização 11)
+                                if a['alert_key'].startswith("task_"):
+                                    task_id = int(a['alert_key'].split("_")[1])
+                                    conn.execute("UPDATE contract_tasks SET status = 'Concluído' WHERE id = %s", (task_id,))
+                                    
+                                conn.commit()
+                                conn.close()
+                                st.success("Alerta encerrado com sucesso!")
+                                st.rerun()
+                            else:
+                                st.error("Senha incorreta!")
         else:
             st.success("🎉 Não há alertas ou notificações críticas pendentes no momento.")
+
             
         st.markdown("### 🔍 Pesquisa Rápida de Contratos")
         search_query = st.text_input("Pesquisar por escola, município, número de contrato ou empresa:")
@@ -900,10 +1185,11 @@ if st.session_state['user'] is not None:
             value_offered = col7.number_input("Valor Ofertado pela Ganhadora (R$) *", min_value=0.0, format="%.2f")
             value_base_bidding = col8.number_input("Valor Base do Edital (R$)", min_value=0.0, format="%.2f")
             
-            col9, col10, col11 = st.columns(3)
+            col9, col10, col11, col11_b = st.columns(4)
             date_base = col9.text_input("Mês/Ano Data-Base", placeholder="Ex: Maio/2025")
             start_date = col10.text_input("Data de Início da Vigência", placeholder="Ex: 07/03/2026")
             end_date = col11.text_input("Data de Fim da Vigência", placeholder="Ex: 19/06/2029")
+            due_date = col11_b.text_input("Data de Prazo (Limite)", placeholder="Ex: 31/12/2028")
             
             st.markdown("#### 🛠️ Empresa Executora e Garantias")
             col12, col13, col14 = st.columns(3)
@@ -945,12 +1231,12 @@ if st.session_state['user'] is not None:
                         INSERT INTO contracts (
                             contract_number, school_name, city, processo_mae, processo_pagamento, 
                             company_name, company_cnpj, contract_company_id, value_initial, value_offered, 
-                            value_base_bidding, date_base, start_date, end_date, warranty_type, created_by
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            value_base_bidding, date_base, start_date, end_date, warranty_type, created_by, due_date
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         contract_number, school_name, city, processo_mae, processo_pagamento,
                         company_name, company_cnpj, contract_company_id, value_initial, value_offered,
-                        value_base_bidding, date_base, start_date, end_date, warranty_type, current_user
+                        value_base_bidding, date_base, start_date, end_date, warranty_type, current_user, due_date
                     ))
                     new_contract_id = cursor.lastrowid
                     
@@ -1040,7 +1326,7 @@ if st.session_state['user'] is not None:
             with tab_dados:
                 st.subheader("Informações Cadastrais (Tabela Fixa)")
                 
-                # Mapear campos para visualização com opção de edição individual
+                # Mapear campos para visualização com opção de edição individual (Adicionando due_date)
                 fields_map = [
                     ("contract_number", "Número do Contrato", c["contract_number"], "text"),
                     ("school_name", "Nome da Escola", c["school_name"], "text"),
@@ -1056,6 +1342,7 @@ if st.session_state['user'] is not None:
                     ("date_base", "Data Base (Mês/Ano)", c["date_base"], "text"),
                     ("start_date", "Início Vigência", c["start_date"], "text"),
                     ("end_date", "Fim Vigência", c["end_date"], "text"),
+                    ("due_date", "Data de Prazo (Limite)", c.get("due_date", ""), "text"),
                     ("warranty_type", "Tipo de Garantia", c["warranty_type"], "text"),
                     ("os_date", "Data da OS", c["os_date"], "text"),
                     ("os_obs", "Observações OS", c["os_obs"], "text"),
@@ -1064,6 +1351,34 @@ if st.session_state['user'] is not None:
                     ("rico_date", "Data da RICO", c["rico_date"], "text"),
                     ("rico_obs", "Observações RICO", c["rico_obs"], "text")
                 ]
+                
+                # Carregar colunas dinâmicas (Cadastros Extras) criados por usuários
+                try:
+                    conn_cols = get_db_connection()
+                    cursor_cols = conn_cols.cursor()
+                    cursor_cols.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'contracts'")
+                    all_db_cols = [row['column_name'] for row in cursor_cols.fetchall()]
+                    
+                    standard_cols = {
+                        'id', 'contract_number', 'school_name', 'city', 'processo_mae', 'processo_pagamento',
+                        'company_name', 'company_cnpj', 'contract_company_id', 'value_initial', 'value_offered',
+                        'value_base_bidding', 'date_base', 'start_date', 'end_date', 'warranty_type',
+                        'os_date', 'os_obs', 'rao_date', 'rao_obs', 'rico_date', 'rico_obs', 'created_by', 'delegated_to', 'due_date'
+                    }
+                    custom_db_cols = [col for col in all_db_cols if col not in standard_cols]
+                    
+                    # Buscar rótulos personalizados
+                    cursor_cols.execute("SELECT column_name, label FROM custom_field_labels")
+                    labels_map = {row['column_name']: row['label'] for row in cursor_cols.fetchall()}
+                    conn_cols.close()
+                    
+                    for custom_col in custom_db_cols:
+                        custom_label = labels_map.get(custom_col, custom_col.replace("custom_", "").replace("_", " ").title())
+                        custom_val = c.get(custom_col, "")
+                        f_type = "number" if isinstance(custom_val, (int, float)) else "text"
+                        fields_map.append((custom_col, custom_label, custom_val, f_type))
+                except Exception as e:
+                    pass
                 
                 # Layout de tabela para os dados fixos
                 for db_field, label, value, f_type in fields_map:
@@ -1109,6 +1424,8 @@ if st.session_state['user'] is not None:
                             "EXCLUIR (Apagar dado permanentemente)"
                         ])
                         
+                        custom_mod_date = st.text_input("Data do Evento Oficial (Ex: Publicação E-Docs / Apostilamento)", value=datetime.now().strftime("%d/%m/%Y"))
+                        
                         st.error("⚠️ ATENÇÃO: Caso selecione SUBSTITUIR ou EXCLUIR, **OS DADOS ANTIGOS SERÃO PERDIDOS PERMANENTEMENTE!**")
                         confirm_pass = st.text_input("Digite sua senha para confirmar a alteração:", type="password")
                         
@@ -1152,7 +1469,7 @@ if st.session_state['user'] is not None:
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                 """, (
                                     selected_contract_id, db_field, str(value or ""), new_val_str, current_user, 
-                                    datetime.now().strftime("%d/%m/%Y %H:%M"), mod_type, datetime.now().strftime("%d/%m/%Y")
+                                    datetime.now().strftime("%d/%m/%Y %H:%M"), mod_type, custom_mod_date
                                 ))
                                 
                                 conn.commit()
@@ -1162,6 +1479,48 @@ if st.session_state['user'] is not None:
                                 st.session_state.pop(edit_state_key)
                                 st.rerun()
                 
+                # Criar Novas Informações Cadastrais (Atualização 6 - Parte 2)
+                if has_edit_permission:
+                    st.markdown("---")
+                    with st.expander("➕ Adicionar Nova Informação Cadastral (Campo Personalizado)"):
+                        with st.form("add_custom_cadastral_field_form"):
+                            new_field_label = st.text_input("Nome do Novo Campo Cadastral (Ex: Local de Execução, Engenheiro Fiscal)", key="new_field_lbl")
+                            new_field_type = st.selectbox("Tipo de Dado", ["Texto", "Número"], key="new_field_tp")
+                            new_field_val = st.text_input("Valor Inicial", key="new_field_vl")
+                            field_submitted = st.form_submit_button("💾 Criar e Adicionar Campo")
+                            
+                            if field_submitted:
+                                if not new_field_label.strip():
+                                    st.error("O nome do campo é obrigatório!")
+                                else:
+                                    # Sanitizar label para formato slug de coluna PostgreSQL
+                                    import re
+                                    col_name = "custom_" + re.sub(r'[^a-zA-Z0-9_]', '', new_field_label.lower().replace(" ", "_"))
+                                    
+                                    try:
+                                        conn_add_col = get_db_connection()
+                                        cursor_add_col = conn_add_col.cursor()
+                                        # Registrar label
+                                        cursor_add_col.execute("""
+                                            INSERT INTO custom_field_labels (column_name, label)
+                                            VALUES (%s, %s) ON CONFLICT (column_name) DO UPDATE SET label = EXCLUDED.label
+                                        """, (col_name, new_field_label.strip()))
+                                        
+                                        # Adicionar coluna na tabela contracts
+                                        col_type = "TEXT" if new_field_type == "Texto" else "DOUBLE PRECISION"
+                                        cursor_add_col.execute(f"ALTER TABLE contracts ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+                                        
+                                        # Atualizar valor no contrato atual
+                                        db_val_to_save = new_field_val if new_field_type == "Texto" else float(new_field_val or 0.0)
+                                        cursor_add_col.execute(f"UPDATE contracts SET {col_name} = %s WHERE id = %s", (db_val_to_save, selected_contract_id))
+                                        
+                                        conn_add_col.commit()
+                                        conn_add_col.close()
+                                        st.success(f"Campo '{new_field_label}' criado com sucesso!")
+                                        st.rerun()
+                                    except Exception as err:
+                                        st.error(f"Erro ao adicionar campo: {err}")
+
                 # Botão de Exclusão Completa do Contrato
                 if has_edit_permission:
                     st.markdown("---")
@@ -1312,33 +1671,109 @@ if st.session_state['user'] is not None:
                                 st.success("Reajuste contratual lançado!")
                                 st.rerun()
 
-            # TAB 3: EQUIPE DE FISCALIZAÇÃO e GESTÃO
+            # TAB 3: EQUIPE DE FISCALIZAÇÃO (Atualização 7 & 8)
             with tab_equipe:
                 st.subheader("Membros Atribuídos ao Contrato")
                 st.caption("Fiscais, Gestores e Apoios Técnicos associados a este processo")
                 
                 registered_users = get_registered_users()
                 
+                # Inicializar estado de edição de membro se não existir
+                edit_member_key = f"active_edit_member_{selected_contract_id}"
+                
                 if roles:
-                    roles_table = []
                     for r in roles:
-                        roles_table.append({
-                            "ID": r['id'],
-                            "Nome/Fiscal": r['username'],
-                            "Função": r['role_type'],
-                            "Área de Atuação": r['area'],
-                            "Início Atuação": r['start_date'],
-                            "Fim Atuação": r['end_date'] if r['end_date'] else "Ativo",
-                            "E-mail": r['email'],
-                            "Observação": r['obs']
-                        })
-                    import pandas as pd
-                    st.table(pd.DataFrame(roles_table).set_index("ID"))
+                        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns([3, 2, 2, 3, 2])
+                        col_m1.write(f"👤 **{r['username']}** ({r['role_type']})")
+                        col_m2.write(f"🛠️ {r['area']}")
+                        col_m3.write(f"📅 {r['start_date']} - {r['end_date'] if r['end_date'] else 'Ativo'}")
+                        col_m4.write(f"✉️ {r['email'] or 'Sem e-mail'}")
+                        
+                        if has_edit_permission:
+                            if col_m5.button("✏️ Modificar/Substituir", key=f"btn_edit_role_{r['id']}"):
+                                st.session_state[edit_member_key] = r['id']
+                    
+                    # Se houver um membro ativo em edição (Atualização 7)
+                    if edit_member_key in st.session_state:
+                        m_id = st.session_state[edit_member_key]
+                        # Carregar dados do membro
+                        conn_m = get_db_connection()
+                        m_data = conn_m.execute("SELECT * FROM contract_roles WHERE id = %s", (m_id,)).fetchone()
+                        conn_m.close()
+                        
+                        st.markdown("---")
+                        st.markdown(f"### ⚙️ Modificar Membro da Equipe: **{m_data['username']}**")
+                        with st.form(f"edit_member_form_{m_id}"):
+                            m_role = st.selectbox("Função", ["Gestor", "Fiscal", "Apoio"], index=["Gestor", "Fiscal", "Apoio"].index(m_data['role_type']))
+                            m_area = st.text_input("Área de Atuação", value=m_data['area'])
+                            m_start = st.text_input("Data de Início", value=m_data['start_date'])
+                            m_end = st.text_input("Data de Término", value=m_data['end_date'] or "")
+                            m_email = st.text_input("E-mail", value=m_data['email'] or "")
+                            m_obs = st.text_area("Observações", value=m_data['obs'] or "")
+                            
+                            action_type_member = st.radio("Selecione a ação:", [
+                                "MODIFICAR (Salvar mantendo a vigência ou observação)",
+                                "SUBSTITUIR (Substituir permanentemente por outro membro)",
+                                "EXCLUIR (Remover membro da equipe)"
+                            ])
+                            
+                            sub_user_opt = ["Nenhum"] + list(registered_users.keys())
+                            m_substitute = st.selectbox("Caso escolha SUBSTITUIR, selecione o novo membro substituto:", sub_user_opt)
+                            
+                            st.warning("⚠️ Operações de SUBSTITUIR e EXCLUIR removem permanentemente os dados de auditoria deste membro para o contrato!")
+                            confirm_m_pass = st.text_input("Digite sua senha para confirmar a operação:", type="password", key=f"pass_member_{m_id}")
+                            
+                            m_cancel = st.form_submit_button("Cancelar")
+                            m_save = st.form_submit_button("💾 Salvar Alteração de Membro")
+                            
+                            if m_cancel:
+                                st.session_state.pop(edit_member_key)
+                                st.rerun()
+                                
+                            if m_save:
+                                conn_save_m = get_db_connection()
+                                u_chk = conn_save_m.execute("SELECT password FROM users WHERE username = %s", (current_user,)).fetchone()
+                                conn_save_m.close()
+                                
+                                if not confirm_m_pass or u_chk['password'] != confirm_m_pass:
+                                    st.error("Senha de confirmação inválida!")
+                                else:
+                                    conn_save_m = get_db_connection()
+                                    if "EXCLUIR" in action_type_member:
+                                        conn_save_m.execute("DELETE FROM contract_roles WHERE id = %s", (m_id,))
+                                        st.success("Membro removido da equipe!")
+                                    elif "SUBSTITUIR" in action_type_member:
+                                        if m_substitute == "Nenhum":
+                                            st.error("Por favor, selecione um substituto válido!")
+                                        else:
+                                            new_email_sub = registered_users[m_substitute]['email']
+                                            new_area_sub = registered_users[m_substitute]['area']
+                                            conn_save_m.execute("""
+                                                UPDATE contract_roles 
+                                                SET username = %s, role_type = %s, area = %s, start_date = %s, end_date = %s, email = %s, obs = %s
+                                                WHERE id = %s
+                                            """, (m_substitute, m_role, new_area_sub, m_start, m_end, new_email_sub, m_obs, m_id))
+                                            st.success("Membro substituído com sucesso!")
+                                    else:
+                                        # MODIFICAR
+                                        conn_save_m.execute("""
+                                            UPDATE contract_roles 
+                                            SET role_type = %s, area = %s, start_date = %s, end_date = %s, email = %s, obs = %s
+                                            WHERE id = %s
+                                        """, (m_role, m_area, m_start, m_end, m_email, m_obs, m_id))
+                                        st.success("Membro atualizado com sucesso!")
+                                        
+                                    conn_save_m.commit()
+                                    conn_save_m.close()
+                                    st.session_state.pop(edit_member_key)
+                                    st.rerun()
                 else:
                     st.info("Nenhum fiscal, gestor ou apoio técnico cadastrado ainda.")
                     
+                # Botão destacado para adicionar novos membros (Atualização 8)
                 if has_edit_permission:
-                    with st.expander("➕ Associar Novo Membro à Equipe"):
+                    st.markdown("---")
+                    with st.expander("➕ Associar Novo Membro à Equipe (Adicionar Novo Membro)"):
                         with st.form("add_role_form"):
                             user_opts = ["Nenhum"] + list(registered_users.keys())
                             add_username = st.selectbox("Selecione um Usuário Cadastrado", user_opts)
@@ -1376,7 +1811,7 @@ if st.session_state['user'] is not None:
                                     conn = get_db_connection()
                                     conn.execute("""
                                         INSERT INTO contract_roles (contract_id, username, role_type, area, start_date, email, obs)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                                     """, (selected_contract_id, final_name, add_role_type, final_area, add_start, add_email, add_obs))
                                     conn.commit()
                                     conn.close()
