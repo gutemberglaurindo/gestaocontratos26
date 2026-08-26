@@ -162,6 +162,18 @@ def init_db():
     except Exception:
         pass
         
+    try:
+        cursor.execute("ALTER TABLE contract_additives ADD COLUMN IF NOT EXISTS acrescimo DOUBLE PRECISION DEFAULT 0.0;")
+        cursor.execute("ALTER TABLE contract_additives ADD COLUMN IF NOT EXISTS decrescimo DOUBLE PRECISION DEFAULT 0.0;")
+    except Exception:
+        pass
+        
+    try:
+        cursor.execute("ALTER TABLE contract_reajustes ADD COLUMN IF NOT EXISTS incc_initial DOUBLE PRECISION DEFAULT 0.0;")
+        cursor.execute("ALTER TABLE contract_reajustes ADD COLUMN IF NOT EXISTS incc_current DOUBLE PRECISION DEFAULT 0.0;")
+    except Exception:
+        pass
+        
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS custom_field_labels (
         column_name TEXT PRIMARY KEY,
@@ -1020,6 +1032,40 @@ if st.session_state['user'] is not None:
                 if (c['id'], ra['alert_key']) not in dismissed_set:
                     alerts.append(ra)
                     
+            # Regra 6: Alertas de proximidade de limite de aditivos (Lei 14.133/2021) - Atualização 16
+            v_init = c['value_initial']
+            if v_init > 0:
+                conn_add = get_db_connection()
+                c_additives = conn_add.execute("SELECT * FROM contract_additives WHERE contract_id = %s", (c['id'],)).fetchall()
+                conn_add.close()
+                
+                cum_acresc_val = sum([a.get('acrescimo') if a.get('acrescimo') is not None else (a['value'] if a['value'] > 0 else 0.0) for a in c_additives])
+                cum_dec_val = sum([a.get('decrescimo') if a.get('decrescimo') is not None else (-a['value'] if a['value'] < 0 else 0.0) for a in c_additives])
+                
+                cum_acresc_pct = (cum_acresc_val / v_init) * 100
+                cum_dec_pct = (cum_dec_val / v_init) * 100
+                
+                contract_name_combined = (c['school_name'] or '') + ' ' + (c['contract_number'] or '')
+                is_reforma = any(w in contract_name_combined.upper() for w in ["REFORMA", "REF", "RECON", "RECONSTRUÇÃO"])
+                limit_pct = 50.0 if is_reforma else 25.0
+                
+                alert_key_add = f"additive_limit_{c['id']}"
+                if (c['id'], alert_key_add) not in dismissed_set:
+                    if cum_acresc_pct >= (limit_pct - 5.0) or cum_dec_pct >= (limit_pct - 5.0):
+                        max_pct = max(cum_acresc_pct, cum_dec_pct)
+                        alert_type = "critical" if max_pct >= limit_pct else "warning"
+                        priority = 1 if max_pct >= limit_pct else 2
+                        alerts.append({
+                            "type": alert_type,
+                            "priority": priority,
+                            "days_left": int((limit_pct - max_pct) * 10),
+                            "due_date_str": f"Limite {limit_pct}%",
+                            "title": f"⚠️ Limite de Aditivos Próximo ({limit_pct}%) - {c['contract_number']}",
+                            "text": f"O contrato da escola **{c['school_name']}** atingiu {max_pct:.2f}% em aditivos (Acréscimos: {cum_acresc_pct:.2f}%, Decréscimos: {cum_dec_pct:.2f}%), aproximando-se do limite de {limit_pct}%!",
+                            "alert_key": alert_key_add,
+                            "contract_id": c['id']
+                        })
+                    
         # Regra 4: Tarefas e Pendências em atraso / abertas (Atualização 9)
         for t in tasks:
             alert_key = f"task_{t['id']}"
@@ -1111,13 +1157,13 @@ if st.session_state['user'] is not None:
                     
                     col_acc, col_dms = st.columns([2, 1])
                     with col_acc:
-                        if st.button("🔍 Acessar Contrato", key=f"alert_btn_{a['contract_id']}_{hash(a['alert_key'])}"):
+                        if st.button("🔍 Acessar Contrato", key=f"alert_btn_{a['contract_id']}_{a['alert_key']}"):
                             st.session_state['selected_contract_id'] = a['contract_id']
                             st.info(f"Direcionando para o contrato da escola... Por favor, selecione a aba 'Visualizar/Editar Contratos' na barra lateral.")
                     with col_dms:
                         with st.expander("🔏 Encerrar Alerta"):
-                            dismiss_pass = st.text_input("Digite sua senha para encerrar:", type="password", key=f"pass_{hash(a['alert_key'])}")
-                            if st.button("Confirmar Encerramento", key=f"dms_btn_{hash(a['alert_key'])}"):
+                            dismiss_pass = st.text_input("Digite sua senha para encerrar:", type="password", key=f"pass_{a['contract_id']}_{a['alert_key']}")
+                            if st.button("Confirmar Encerramento", key=f"dms_btn_{a['contract_id']}_{a['alert_key']}_dms"):
                                 conn = get_db_connection()
                                 u_chk = conn.execute("SELECT password FROM users WHERE username = %s", (current_user,)).fetchone()
                                 if u_chk and u_chk['password'] == dismiss_pass:
@@ -1646,58 +1692,118 @@ if st.session_state['user'] is not None:
                 col_f3.metric("Total Reajustado", f"R$ {current_value:,.2f}")
                 col_f4.metric("Saldo do Contrato", f"R$ {balance:,.2f}")
                 
-                # Seção de Medições Realizadas
-                st.markdown("#### 📏 Medições Realizadas")
-                if measurements:
-                    import pandas as pd
-                    meas_data = []
-                    for m in measurements:
-                        meas_data.append({
-                            "ID": m['id'],
-                            "Nº Medição": m['measurement_num'],
-                            "Data/Período": m['date'],
-                            "Valor Medido (R$)": f"R$ {m['value']:,.2f}",
-                            "Valor Reajuste (R$)": f"R$ {m['value_reajuste']:,.2f}",
-                            "Observação": m['obs']
+                # Seção de Medições Realizadas (Grade de 12 Meses - Atualização 18)
+                st.markdown("#### 📏 Lançamento Mensal de Medições (Grade de 12 Meses)")
+                st.caption("Acompanhamento mensal estruturado das medições de 1 a 12 de acordo com o cronograma.")
+                
+                # Construir grade de 12 meses para o contrato selecionado
+                monthly_slots = []
+                for m_num in range(1, 13):
+                    slot_data = next((m for m in measurements if m['measurement_num'] == m_num), None)
+                    if slot_data:
+                        monthly_slots.append({
+                            "ID": slot_data['id'],
+                            "Nº Medição": f"{m_num}ª Medição",
+                            "Mês/Período": slot_data['date'] or f"Mês {m_num}",
+                            "Valor Medido (R$)": f"R$ {slot_data['value']:,.2f}",
+                            "Valor Reajuste (R$)": f"R$ {slot_data['value_reajuste']:,.2f}",
+                            "Status": "🟢 Lançado",
+                            "Observação": slot_data['obs'] or ""
                         })
-                    st.table(pd.DataFrame(meas_data).set_index("ID"))
-                else:
-                    st.info("Nenhuma medição lançada para este contrato.")
+                    else:
+                        monthly_slots.append({
+                            "ID": None,
+                            "Nº Medição": f"{m_num}ª Medição",
+                            "Mês/Período": "Pendente",
+                            "Valor Medido (R$)": "R$ 0,00",
+                            "Valor Reajuste (R$)": "R$ 0,00",
+                            "Status": "⚪ Não Lançado",
+                            "Observação": ""
+                        })
+                        
+                import pandas as pd
+                df_slots = pd.DataFrame(monthly_slots)
+                st.dataframe(df_slots.drop(columns=["ID"]).set_index("Nº Medição"), use_container_width=True)
+                
+                # Exibir medições extras (acima do mês 12) se houver
+                extra_meas = [m for m in measurements if m['measurement_num'] > 12 or m['measurement_num'] is None]
+                if extra_meas:
+                    st.markdown("##### ➕ Medições Extras (Acima de 12 meses)")
+                    extra_data = []
+                    for em in extra_meas:
+                        extra_data.append({
+                            "ID": em['id'],
+                            "Nº Medição": f"{em['measurement_num']}ª Medição" if em['measurement_num'] else "N/A",
+                            "Mês/Período": em['date'] or "",
+                            "Valor Medido (R$)": f"R$ {em['value']:,.2f}",
+                            "Valor Reajuste (R$)": f"R$ {em['value_reajuste']:,.2f}",
+                            "Observação": em['obs'] or ""
+                        })
+                    st.dataframe(pd.DataFrame(extra_data).set_index("ID"), use_container_width=True)
                     
+                # Formulário para Lançamento/Edição de medições na grade
                 if has_edit_permission:
-                    with st.expander("➕ Lançar Nova Medição"):
-                        with st.form("new_measurement_form"):
-                            m_num = st.number_input("Número da Medição", min_value=1, step=1)
-                            m_date = st.text_input("Data ou Período da Medição", placeholder="Ex: Junho/2026")
-                            m_val = st.number_input("Valor Medido (R$)", min_value=0.0, format="%.2f")
-                            m_reaj = st.number_input("Valor do Reajuste na Medição (R$)", min_value=0.0, format="%.2f")
-                            m_obs = st.text_area("Observações da Medição")
-                            m_submit = st.form_submit_button("Salvar Medição")
+                    with st.expander("⚙️ Lançar/Editar Medição na Grade"):
+                        options_edit = [f"{i}ª Medição" for i in range(1, 13)] + ["Medição Extra / Outra"]
+                        selected_opt = st.selectbox("Selecione o slot de medição para Lançar ou Atualizar:", options_edit, key=f"sel_meas_edit_opt_{selected_contract_id}")
+                        
+                        if selected_opt == "Medição Extra / Outra":
+                            edit_m_num = st.number_input("Número da Medição Customizado", min_value=13, value=13, step=1, key=f"custom_m_num_edit_{selected_contract_id}")
+                        else:
+                            edit_m_num = int(selected_opt.split("ª")[0])
                             
+                        current_meas_record = next((m for m in measurements if m['measurement_num'] == edit_m_num), None)
+                        curr_date = current_meas_record['date'] if current_meas_record else ""
+                        curr_value = float(current_meas_record['value'] or 0.0) if current_meas_record else 0.0
+                        curr_reaj = float(current_meas_record['value_reajuste'] or 0.0) if current_meas_record else 0.0
+                        curr_obs = current_meas_record['obs'] if current_meas_record else ""
+                        
+                        with st.form(f"launch_measurement_form_{edit_m_num}_{selected_contract_id}"):
+                            st.write(f"📝 **Lançamento para {edit_m_num}ª Medição**")
+                            m_date_inp = st.text_input("Data ou Período da Medição", value=curr_date, placeholder="Ex: Junho/2026", key=f"m_date_inp_{edit_m_num}")
+                            m_val_inp = st.number_input("Valor Medido (R$)", min_value=0.0, format="%.2f", value=curr_value, key=f"m_val_inp_{edit_m_num}")
+                            m_reaj_inp = st.number_input("Valor do Reajuste na Medição (R$)", min_value=0.0, format="%.2f", value=curr_reaj, key=f"m_reaj_inp_{edit_m_num}")
+                            m_obs_inp = st.text_area("Observações da Medição", value=curr_obs, key=f"m_obs_inp_{edit_m_num}")
+                            
+                            m_submit = st.form_submit_button("💾 Salvar Lançamento de Medição")
                             if m_submit:
                                 conn = get_db_connection()
-                                conn.execute("""
-                                    INSERT INTO contract_measurements (contract_id, measurement_num, date, value, value_reajuste, balance, obs)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                                """, (selected_contract_id, m_num, m_date, m_val, m_reaj, 0.0, m_obs))
+                                if current_meas_record:
+                                    conn.execute("""
+                                        UPDATE contract_measurements 
+                                        SET date = %s, value = %s, value_reajuste = %s, obs = %s 
+                                        WHERE contract_id = %s AND measurement_num = %s
+                                    """, (m_date_inp, m_val_inp, m_reaj_inp, m_obs_inp, selected_contract_id, edit_m_num))
+                                    st.success(f"Medição {edit_m_num} atualizada com sucesso!")
+                                else:
+                                    conn.execute("""
+                                        INSERT INTO contract_measurements (contract_id, measurement_num, date, value, value_reajuste, balance, obs)
+                                        VALUES (%s, %s, %s, %s, %s, 0.0, %s)
+                                    """, (selected_contract_id, edit_m_num, m_date_inp, m_val_inp, m_reaj_inp, m_obs_inp))
+                                    st.success(f"Medição {edit_m_num} cadastrada com sucesso!")
                                 conn.commit()
                                 conn.close()
-                                st.success("Medição cadastrada!")
                                 st.rerun()
 
-                # Seção de Aditivos Contratuais
-                st.markdown("#### ➕ Termos Aditivos")
+                # Seção de Aditivos Contratuais (Atualização 16)
+                st.markdown("#### ➕ Termos Aditivos (Acréscimos e Decréscimos)")
                 if additives:
                     add_data = []
                     for a in additives:
+                        acrescimo = a.get('acrescimo') if a.get('acrescimo') is not None else (a['value'] if a['value'] > 0 else 0.0)
+                        decrescimo = a.get('decrescimo') if a.get('decrescimo') is not None else (-a['value'] if a['value'] < 0 else 0.0)
+                        pct_acrescimo = (acrescimo / c['value_initial'] * 100) if c['value_initial'] > 0 else 0.0
+                        pct_decrescimo = (decrescimo / c['value_initial'] * 100) if c['value_initial'] > 0 else 0.0
+                        
                         add_data.append({
                             "ID": a['id'],
                             "Valor Aditivo (R$)": f"R$ {a['value']:,.2f}",
+                            "Acréscimo": f"R$ {acrescimo:,.2f} ({pct_acrescimo:.2f}%)",
+                            "Decréscimo": f"R$ {decrescimo:,.2f} ({pct_decrescimo:.2f}%)",
                             "Data Assinatura": a['date'],
                             "Prazo Adicionado (Dias)": a['prazo_dias'],
                             "Objeto / Observações": a['obs']
                         })
-                    import pandas as pd
                     st.table(pd.DataFrame(add_data).set_index("ID"))
                 else:
                     st.info("Nenhum termo aditivo lançado.")
@@ -1705,24 +1811,54 @@ if st.session_state['user'] is not None:
                 if has_edit_permission:
                     with st.expander("➕ Adicionar Termo Aditivo"):
                         with st.form("new_additive_form"):
-                            a_val = st.number_input("Valor do Aditivo (R$)", format="%.2f")
+                            a_acrescimo = st.number_input("Valor do Acréscimo (R$)", min_value=0.0, format="%.2f", value=0.0)
+                            a_decrescimo = st.number_input("Valor do Decréscimo (R$)", min_value=0.0, format="%.2f", value=0.0)
                             a_date = st.text_input("Data de Assinatura", placeholder="Ex: 11/09/2025")
                             a_prazo = st.number_input("Prazo Prorrogado (Dias)", min_value=0, step=1)
                             a_obs = st.text_area("Objeto / Justificativa")
-                            a_submit = st.form_submit_button("Salvar Aditivo")
                             
+                            st.info("💡 Os percentuais são calculados sobre o valor inicial do contrato.")
+                            
+                            contract_name_combined = (c['school_name'] or '') + ' ' + (c['contract_number'] or '')
+                            is_reforma = any(w in contract_name_combined.upper() for w in ["REFORMA", "REF", "RECON", "RECONSTRUÇÃO"])
+                            contract_type_label = "Reforma" if is_reforma else "Obra"
+                            limit_pct = 50.0 if is_reforma else 25.0
+                            
+                            st.write(f"**Tipo de Contrato:** {contract_type_label} (Limite Legal da Lei 14.133/2021: **{limit_pct}%**)")
+                            
+                            v_initial = c['value_initial'] if c['value_initial'] > 0 else 1.0
+                            pct_acresc_new = (a_acrescimo / v_initial) * 100
+                            pct_dec_new = (a_decrescimo / v_initial) * 100
+                            
+                            cum_acresc_val = sum([a.get('acrescimo') if a.get('acrescimo') is not None else (a['value'] if a['value'] > 0 else 0.0) for a in additives])
+                            cum_dec_val = sum([a.get('decrescimo') if a.get('decrescimo') is not None else (-a['value'] if a['value'] < 0 else 0.0) for a in additives])
+                            
+                            new_cum_acresc_pct = ((cum_acresc_val + a_acrescimo) / v_initial) * 100
+                            new_cum_dec_pct = ((cum_dec_val + a_decrescimo) / v_initial) * 100
+                            
+                            st.write(f"**Percentual Acumulado (Acréscimo):** {new_cum_acresc_pct:.2f}% / {limit_pct}%")
+                            st.write(f"**Percentual Acumulado (Decréscimo):** {new_cum_dec_pct:.2f}% / {limit_pct}%")
+                            
+                            if new_cum_acresc_pct >= (limit_pct - 5.0) or new_cum_dec_pct >= (limit_pct - 5.0):
+                                st.warning(f"⚠️ **Alerta:** Os aditivos acumulados aproximam-se ou ultrapassam o limite de **{limit_pct}%** previsto na Lei 14.133/2021!")
+                                
+                            global_val_aditivo = a_acrescimo - a_decrescimo
+                            st.write(f"**Valor Global do Aditivo (Acréscimo - Decréscimo):** R$ {global_val_aditivo:,.2f}")
+                            st.warning("⚠️ *Valor Global apenas para fim de Reajuste. Não compensar Acréscimo com Decréscimo (Lei 14.133/2021).*")
+                            
+                            a_submit = st.form_submit_button("Salvar Aditivo")
                             if a_submit:
                                 conn = get_db_connection()
                                 conn.execute("""
-                                    INSERT INTO contract_additives (contract_id, value, date, prazo_dias, obs)
-                                    VALUES (?, ?, ?, ?, ?)
-                                """, (selected_contract_id, a_val, a_date, a_prazo, a_obs))
+                                    INSERT INTO contract_additives (contract_id, value, date, prazo_dias, obs, acrescimo, decrescimo)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """, (selected_contract_id, global_val_aditivo, a_date, a_prazo, a_obs, a_acrescimo, a_decrescimo))
                                 conn.commit()
                                 conn.close()
-                                st.success("Termo Aditivo registrado!")
+                                st.success("Termo Aditivo registrado com sucesso!")
                                 st.rerun()
 
-                # Seção de Reajustes Contratuais
+                # Seção de Reajustes Contratuais (Atualização 17)
                 st.markdown("#### 📈 Histórico de Reajustes e Apostilamentos")
                 if reajustes:
                     reaj_data = []
@@ -1730,35 +1866,53 @@ if st.session_state['user'] is not None:
                         reaj_data.append({
                             "ID": r['id'],
                             "Identificação / Número": r['num_reajuste'],
-                            "Índice Aplicado": f"{r['index_val']:.7f}",
+                            "INCC Inicial": f"{r.get('incc_initial', 0.0):,.4f}" if r.get('incc_initial') else "N/A",
+                            "INCC Reajuste": f"{r.get('incc_current', 0.0):,.4f}" if r.get('incc_current') else "N/A",
+                            "Índice Aplicado": f"{r['index_val']:.7f} ({r['index_val']*100:.2f}%)",
                             "Valor do Reajuste (R$)": f"R$ {r['value']:,.2f}",
                             "Notas / Descrição": r['obs']
                         })
-                    import pandas as pd
                     st.table(pd.DataFrame(reaj_data).set_index("ID"))
                 else:
                     st.info("Nenhum reajuste ou apostilamento cadastrado.")
                     
                 if has_edit_permission:
-                    with st.expander("➕ Lançar Novo Reajuste/Apostilamento"):
+                    with st.expander("➕ Lançar Novo Reajuste/Apostilamento (Baseado no INCC)"):
                         with st.form("new_reajuste_form"):
-                            r_num = st.text_input("Identificador do Reajuste", placeholder="Ex: Reajuste #64 / INCC")
-                            r_idx = st.number_input("Índice de Reajuste (ex: 0.0721130)", format="%.7f", step=0.0000001)
-                            r_val = st.number_input("Valor do Reajuste Contratual (R$)", min_value=0.0, format="%.2f")
+                            r_num = st.text_input("Identificador do Reajuste", placeholder="Ex: Reajuste Anual #1 / INCC")
+                            r_incc_init = st.number_input("INCC do Ano Inicial", min_value=0.0, format="%.4f", value=100.0)
+                            r_incc_curr = st.number_input("INCC do Ano do Reajuste", min_value=0.0, format="%.4f", value=107.2113)
                             r_obs = st.text_area("Observações / Justificativa")
-                            r_submit = st.form_submit_button("Salvar Reajuste")
                             
+                            # Cálculos automáticos
+                            calc_index = (r_incc_curr - r_incc_init) / r_incc_init if r_incc_init > 0 else 0.0
+                            st.info(f"📊 **Índice Calculado (INCC):** {calc_index:.7f} ({calc_index*100:.2f}%)")
+                            
+                            # Base de Cálculo: (Valor Inicial + Aditivos anteriores) - Medições anteriores
+                            v_initial = c['value_initial']
+                            tot_additives_val = sum([a['value'] for a in additives])
+                            tot_measurements_val = sum([m['value'] for m in measurements])
+                            balance_base = (v_initial + tot_additives_val) - tot_measurements_val
+                            calculated_reaj_val = balance_base * calc_index
+                            
+                            st.write(f"**Valor Inicial do Contrato:** R$ {v_initial:,.2f}")
+                            st.write(f"**Total de Aditivos Anteriores:** R$ {tot_additives_val:,.2f}")
+                            st.write(f"**Total de Medições Realizadas:** R$ {tot_measurements_val:,.2f}")
+                            st.write(f"**Saldo do Contrato para Base de Cálculo:** R$ {balance_base:,.2f}")
+                            st.write(f"✨ **Valor do Reajuste Calculado:** R$ {calculated_reaj_val:,.2f}")
+                            
+                            r_submit = st.form_submit_button("Salvar Reajuste")
                             if r_submit:
                                 conn = get_db_connection()
                                 conn.execute("""
-                                    INSERT INTO contract_reajustes (contract_id, num_reajuste, index_val, value, obs)
-                                    VALUES (?, ?, ?, ?, ?)
-                                """, (selected_contract_id, r_num, r_idx, r_val, r_obs))
+                                    INSERT INTO contract_reajustes (contract_id, num_reajuste, index_val, value, obs, incc_initial, incc_current)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """, (selected_contract_id, r_num, calc_index, calculated_reaj_val, r_obs, r_incc_init, r_incc_curr))
                                 conn.commit()
                                 conn.close()
-                                st.success("Reajuste contratual lançado!")
+                                st.success("Reajuste contratual lançado com sucesso!")
                                 st.rerun()
-
+                                
             # TAB 3: EQUIPE DE FISCALIZAÇÃO (Atualização 7 & 8)
             with tab_equipe:
                 st.subheader("Membros Atribuídos ao Contrato")
