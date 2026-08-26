@@ -887,11 +887,10 @@ if st.session_state['user'] is not None:
         conn = get_db_connection()
         contracts = conn.execute("SELECT * FROM contracts").fetchall()
         tasks = conn.execute("SELECT t.*, c.school_name FROM contract_tasks t JOIN contracts c ON t.contract_id = c.id WHERE t.status != 'Concluído'").fetchall()
-        conn.close()
-        
-                # Buscar alertas já encerrados (dismissed)
+        # Buscar alertas já encerrados (dismissed)
         dismissed_res = conn.execute("SELECT contract_id, alert_key FROM dismissed_notifications").fetchall()
         dismissed_set = {(r['contract_id'], r['alert_key']) for r in dismissed_res}
+        conn.close()
         
         alerts = []
         today_val = date.today()
@@ -1090,76 +1089,81 @@ if st.session_state['user'] is not None:
         # Ordenação de Alertas por Prioridade e Proximidade de Data (Atualização 2)
         alerts.sort(key=lambda x: (x['priority'], x['days_left']))
 
-        if alerts:
-            for a in alerts:
-                text_color = "#ef4444" if a['type'] == "critical" else ("#f59e0b" if a['type'] == "warning" else "#0ea5e9")
-                st.markdown(f"""
-                <div class="card-{a['type']}" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-radius: 8px;">
-                    <div style="flex-grow: 1;">
-                        <div class="card-title" style="margin-bottom: 3px;">{a['title']}</div>
-                        <div class="card-text">{a['text']}</div>
+        # Criar duas colunas no painel de controle (Atualização 14)
+        col_dash_left, col_dash_right = st.columns([5, 7])
+        
+        with col_dash_left:
+            st.markdown("### 🔔 Notificações e Prazos Críticos")
+            if alerts:
+                for a in alerts:
+                    text_color = "#ef4444" if a['type'] == "critical" else ("#f59e0b" if a['type'] == "warning" else "#0ea5e9")
+                    st.markdown(f"""
+                    <div class="card-{a['type']}" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-radius: 8px;">
+                        <div style="flex-grow: 1;">
+                            <div class="card-title" style="margin-bottom: 3px;">{a['title']}</div>
+                            <div class="card-text">{a['text']}</div>
+                        </div>
+                        <div style="font-weight: bold; font-size: 15px; color: {text_color}; white-space: nowrap; margin-left: 15px; text-align: right;">
+                            📅 {a['due_date_str']}
+                        </div>
                     </div>
-                    <div style="font-weight: bold; font-size: 15px; color: {text_color}; white-space: nowrap; margin-left: 15px; text-align: right;">
-                        📅 {a['due_date_str']}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                col_acc, col_dms = st.columns([2, 1])
-                with col_acc:
-                    if st.button("🔍 Acessar Contrato", key=f"alert_btn_{a['contract_id']}_{hash(a['alert_key'])}"):
-                        st.session_state['selected_contract_id'] = a['contract_id']
-                        st.info(f"Direcionando para o contrato da escola... Por favor, selecione a aba 'Visualizar/Editar Contratos' na barra lateral.")
-                with col_dms:
-                    with st.expander("🔏 Encerrar Alerta"):
-                        dismiss_pass = st.text_input("Digite sua senha para encerrar:", type="password", key=f"pass_{hash(a['alert_key'])}")
-                        if st.button("Confirmar Encerramento", key=f"dms_btn_{hash(a['alert_key'])}"):
-                            conn = get_db_connection()
-                            u_chk = conn.execute("SELECT password FROM users WHERE username = %s", (current_user,)).fetchone()
-                            if u_chk and u_chk['password'] == dismiss_pass:
-                                conn.execute("""
-                                    INSERT INTO dismissed_notifications (contract_id, alert_key, dismissed_by, dismissed_at)
-                                    VALUES (%s, %s, %s, %s)
-                                """, (a['contract_id'], a['alert_key'], current_user, datetime.now().strftime("%d/%m/%Y %H:%M")))
-                                
-                                # Se o alerta era vinculado a uma tarefa/pendência, encerrá-la também (Atualização 11)
-                                if a['alert_key'].startswith("task_"):
-                                    task_id = int(a['alert_key'].split("_")[1])
-                                    conn.execute("UPDATE contract_tasks SET status = 'Concluído' WHERE id = %s", (task_id,))
+                    """, unsafe_allow_html=True)
+                    
+                    col_acc, col_dms = st.columns([2, 1])
+                    with col_acc:
+                        if st.button("🔍 Acessar Contrato", key=f"alert_btn_{a['contract_id']}_{hash(a['alert_key'])}"):
+                            st.session_state['selected_contract_id'] = a['contract_id']
+                            st.info(f"Direcionando para o contrato da escola... Por favor, selecione a aba 'Visualizar/Editar Contratos' na barra lateral.")
+                    with col_dms:
+                        with st.expander("🔏 Encerrar Alerta"):
+                            dismiss_pass = st.text_input("Digite sua senha para encerrar:", type="password", key=f"pass_{hash(a['alert_key'])}")
+                            if st.button("Confirmar Encerramento", key=f"dms_btn_{hash(a['alert_key'])}"):
+                                conn = get_db_connection()
+                                u_chk = conn.execute("SELECT password FROM users WHERE username = %s", (current_user,)).fetchone()
+                                if u_chk and u_chk['password'] == dismiss_pass:
+                                    conn.execute("""
+                                        INSERT INTO dismissed_notifications (contract_id, alert_key, dismissed_by, dismissed_at)
+                                        VALUES (%s, %s, %s, %s)
+                                    """, (a['contract_id'], a['alert_key'], current_user, datetime.now().strftime("%d/%m/%Y %H:%M")))
                                     
-                                conn.commit()
-                                conn.close()
-                                st.success("Alerta encerrado com sucesso!")
-                                st.rerun()
-                            else:
-                                st.error("Senha incorreta!")
-        else:
-            st.success("🎉 Não há alertas ou notificações críticas pendentes no momento.")
+                                    # Se o alerta era vinculado a uma tarefa/pendência, encerrá-la também (Atualização 11)
+                                    if a['alert_key'].startswith("task_"):
+                                        task_id = int(a['alert_key'].split("_")[1])
+                                        conn.execute("UPDATE contract_tasks SET status = 'Concluído' WHERE id = %s", (task_id,))
+                                        
+                                    conn.commit()
+                                    conn.close()
+                                    st.success("Alerta encerrado com sucesso!")
+                                    st.rerun()
+                                else:
+                                    st.error("Senha incorreta!")
+            else:
+                st.success("🎉 Não há alertas ou notificações críticas pendentes no momento.")
 
+        with col_dash_right:
+            st.markdown("### 📋 Resumo & Pesquisa de Contratos")
+            search_query = st.text_input("Pesquisar por escola, município, número de contrato ou empresa:")
             
-        st.markdown("### 🔍 Pesquisa Rápida de Contratos")
-        search_query = st.text_input("Pesquisar por escola, município, número de contrato ou empresa:")
-        
-        conn = get_db_connection()
-        if search_query:
-            query = f"%{search_query}%"
-            contracts_list = conn.execute("""
-                SELECT id, contract_number, school_name, city, company_name, value_initial, end_date 
-                FROM contracts 
-                WHERE school_name LIKE ? OR city LIKE ? OR contract_number LIKE ? OR company_name LIKE ?
-            """, (query, query, query, query)).fetchall()
-        else:
-            contracts_list = conn.execute("SELECT id, contract_number, school_name, city, company_name, value_initial, end_date FROM contracts").fetchall()
-        conn.close()
-        
-        if contracts_list:
-            # Render clean table
-            import pandas as pd
-            df = pd.DataFrame([dict(r) for r in contracts_list])
-            df.columns = ["ID", "Nº Contrato", "Escola", "Município", "Empresa", "Valor Inicial (R$)", "Fim Vigência"]
-            st.dataframe(df.set_index("ID"), use_container_width=True)
-        else:
-            st.write("Nenhum contrato encontrado.")
+            conn = get_db_connection()
+            if search_query:
+                query = f"%{search_query}%"
+                contracts_list = conn.execute("""
+                    SELECT id, contract_number, school_name, city, company_name, value_initial, end_date 
+                    FROM contracts 
+                    WHERE school_name LIKE ? OR city LIKE ? OR contract_number LIKE ? OR company_name LIKE ?
+                """, (query, query, query, query)).fetchall()
+            else:
+                contracts_list = conn.execute("SELECT id, contract_number, school_name, city, company_name, value_initial, end_date FROM contracts").fetchall()
+            conn.close()
+            
+            if contracts_list:
+                # Render clean table
+                import pandas as pd
+                df = pd.DataFrame([dict(r) for r in contracts_list])
+                df.columns = ["ID", "Nº Contrato", "Escola", "Município", "Empresa", "Valor Inicial (R$)", "Fim Vigência"]
+                st.dataframe(df.set_index("ID"), use_container_width=True)
+            else:
+                st.write("Nenhum contrato encontrado.")
 
     # --- 2. ADICIONAR CONTRATO ---
     elif menu == "📂 Adicionar Contrato":
@@ -1280,14 +1284,15 @@ if st.session_state['user'] is not None:
             except ValueError:
                 selected_idx = 0
                 
-            selected_contract_label = st.selectbox(
-                "Selecione o Contrato para detalhamento:", 
-                list(c_options.keys()), 
-                index=selected_idx,
-                key="contract_selectbox_widget"
-            )
-            
-            # Atualizar o ID persistido com base na seleção atual do selectbox
+            # Seleção de Contrato e Botão de Edição de Título (Atualização 12)
+            col_sel, col_edit_title = st.columns([8, 2])
+            with col_sel:
+                selected_contract_label = st.selectbox(
+                    "Selecione o Contrato para detalhamento:", 
+                    list(c_options.keys()), 
+                    index=selected_idx,
+                    key="contract_selectbox_widget"
+                )
             selected_contract_id = c_options[selected_contract_label]
             st.session_state['persisted_contract_id'] = selected_contract_id
             
@@ -1302,8 +1307,89 @@ if st.session_state['user'] is not None:
             history = conn.execute("SELECT * FROM contract_history WHERE contract_id = ? ORDER BY id DESC", (selected_contract_id,)).fetchall()
             conn.close()
             
+            # Verificação de Autorização: Somente o criador ou delegado pode editar
+            is_creator = (c['created_by'] == current_user)
+            is_delegated = c['delegated_to'] and (current_user in c['delegated_to'].split(","))
+            is_developer = (current_role == "DEVELOPER")
+            has_edit_permission = is_creator or is_delegated or is_developer
+
+            # Botão de edição de título (Atualização 12)
+            with col_edit_title:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True) # spacing
+                if has_edit_permission:
+                    if st.button("✏️ Modificar Título", key=f"edit_contract_title_btn_{selected_contract_id}"):
+                        st.session_state[f"editing_contract_title_{selected_contract_id}"] = True
+                        st.rerun()
+
+            # Formulário de edição de título (Atualização 12)
+            if st.session_state.get(f"editing_contract_title_{selected_contract_id}"):
+                with st.form(f"edit_contract_title_form_{selected_contract_id}"):
+                    st.markdown("### ✏️ Modificar Identificação Principal (Título)")
+                    new_number = st.text_input("Número do Contrato", value=c["contract_number"])
+                    new_school = st.text_input("Nome da Escola", value=c["school_name"])
+                    
+                    action_type = st.radio("Selecione a ação para o título:", [
+                        "MODIFICAR (Manter valor antigo com risco de histórico)",
+                        "SUBSTITUIR (Substituir permanentemente - Perda dos dados antigos)"
+                    ], key=f"title_action_{selected_contract_id}")
+                    
+                    if "SUBSTITUIR" in action_type:
+                        st.error("⚠️ Ao confirmar os dados anteriores desse item serão perdidos")
+                        
+                    confirm_pass = st.text_input("Digite sua senha para confirmar a alteração:", type="password", key=f"title_confirm_pass_{selected_contract_id}")
+                    
+                    col_t_cancel, col_t_save = st.columns(2)
+                    t_cancel = col_t_cancel.form_submit_button("Cancelar")
+                    t_save = col_t_save.form_submit_button("💾 Salvar Alteração")
+                    
+                    if t_cancel:
+                        st.session_state.pop(f"editing_contract_title_{selected_contract_id}", None)
+                        st.rerun()
+                        
+                    if t_save:
+                        conn = get_db_connection()
+                        u_chk = conn.execute("SELECT password FROM users WHERE username = ?", (current_user,)).fetchone()
+                        conn.close()
+                        
+                        if not u_chk or u_chk['password'] != confirm_pass:
+                            st.error("Senha de confirmação inválida!")
+                        else:
+                            mod_type = "MODIFICAR" if "MODIFICAR" in action_type else "SUBSTITUIR"
+                            
+                            conn = get_db_connection()
+                            conn.execute("UPDATE contracts SET contract_number = ?, school_name = ? WHERE id = ?", (new_number, new_school, selected_contract_id))
+                            
+                            if mod_type == "SUBSTITUIR":
+                                conn.execute("DELETE FROM contract_history WHERE contract_id = ? AND field_name = 'contract_number'", (selected_contract_id,))
+                                conn.execute("DELETE FROM contract_history WHERE contract_id = ? AND field_name = 'school_name'", (selected_contract_id,))
+                            
+                            conn.execute("""
+                                INSERT INTO contract_history (contract_id, field_name, old_value, new_value, modified_by, modified_at, modification_type, initial_date)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (selected_contract_id, "contract_number", c["contract_number"], new_number, current_user, datetime.now().strftime("%d/%m/%Y %H:%M"), mod_type, datetime.now().strftime("%d/%m/%Y")))
+                            
+                            conn.execute("""
+                                INSERT INTO contract_history (contract_id, field_name, old_value, new_value, modified_by, modified_at, modification_type, initial_date)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (selected_contract_id, "school_name", c["school_name"], new_school, current_user, datetime.now().strftime("%d/%m/%Y %H:%M"), mod_type, datetime.now().strftime("%d/%m/%Y")))
+                            
+                            conn.commit()
+                            conn.close()
+                            
+                            st.session_state.pop(f"editing_contract_title_{selected_contract_id}", None)
+                            st.success("Identificação do contrato atualizada com sucesso!")
+                            st.rerun()
+            
             st.markdown(f"## 🏫 {c['school_name']} ({c['city']}/ES)")
-            st.caption(f"Contrato Administrativo nº **{c['contract_number']}** | Processo E-Docs: **{c['processo_mae']}**")
+            
+            # Subtítulo Completo com Processo de Pagamento e Pendências (Atualização 15)
+            payment_proc = c.get('processo_pagamento') or "Não informado"
+            caption_text = f"Contrato Administrativo nº **{c['contract_number']}** | Processo E-Docs: **{c['processo_mae']}** | Processo de Pagamento: **{payment_proc}**"
+            
+            pending_tasks = [t for t in tasks if t['status'] != 'Concluído']
+            if pending_tasks:
+                caption_text += f" | <span style='color:#ef4444; font-weight:bold;'>🔴 {len(pending_tasks)} Pendência(s) em Aberto</span>"
+            st.markdown(f"<div style='font-size: 14px; color: #6b7280; margin-bottom: 15px;'>{caption_text}</div>", unsafe_allow_html=True)
             
             # Verificação de Autorização: Somente o criador ou delegado pode editar
             is_creator = (c['created_by'] == current_user)
@@ -1400,10 +1486,11 @@ if st.session_state['user'] is not None:
                     else:
                         col_val.write(value if value not in [None, ""] else "*(Vazio)*")
                     
-                    # Se tem permissão de escrita, mostra o botão de modificação
+                    # Se tem permissão de escrita, mostra o botão de modificação (Adicionado st.rerun() para robustez)
                     if has_edit_permission:
                         if col_action.button("✏️ Modificar/Substituir", key=f"edit_{db_field}_{selected_contract_id}"):
                             st.session_state[f"active_edit_{selected_contract_id}"] = (db_field, label, value, f_type)
+                            st.rerun()
                 
                 # Container de Edição Ativo
                 edit_state_key = f"active_edit_{selected_contract_id}"
@@ -1426,7 +1513,8 @@ if st.session_state['user'] is not None:
                         
                         custom_mod_date = st.text_input("Data do Evento Oficial (Ex: Publicação E-Docs / Apostilamento)", value=datetime.now().strftime("%d/%m/%Y"))
                         
-                        st.error("⚠️ ATENÇÃO: Caso selecione SUBSTITUIR ou EXCLUIR, **OS DADOS ANTIGOS SERÃO PERDIDOS PERMANENTEMENTE!**")
+                        if "SUBSTITUIR" in action_type or "EXCLUIR" in action_type:
+                            st.error("⚠️ Ao confirmar os dados anteriores desse item serão perdidos")
                         confirm_pass = st.text_input("Digite sua senha para confirmar a alteração:", type="password")
                         
                         cancel_btn = st.form_submit_button("Cancelar")
@@ -1442,7 +1530,7 @@ if st.session_state['user'] is not None:
                             u_chk = conn.execute("SELECT password FROM users WHERE username = ?", (current_user,)).fetchone()
                             conn.close()
                             
-                            if not confirm_pass or u_chk['password'] != confirm_pass:
+                            if not u_chk or not confirm_pass or u_chk['password'] != confirm_pass:
                                 st.error("Senha de confirmação inválida!")
                             else:
                                 mod_type = "MODIFICAR" if "MODIFICAR" in action_type else ("SUBSTITUIR" if "SUBSTITUIR" in action_type else "EXCLUIR")
