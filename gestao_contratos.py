@@ -159,6 +159,23 @@ def init_db():
     # Executar migração caso a coluna due_date ou tabelas novas não existam no Supabase já populado
     try:
         cursor.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS due_date TEXT;")
+        cursor.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS value_initial_obs TEXT;")
+        cursor.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS value_offered_obs TEXT;")
+        cursor.execute("ALTER TABLE contracts ADD COLUMN IF NOT EXISTS value_base_bidding_obs TEXT;")
+    except Exception:
+        pass
+        
+    try:
+        cursor.execute("ALTER TABLE contract_additives ADD COLUMN IF NOT EXISTS acrescimo DOUBLE PRECISION DEFAULT 0.0;")
+        cursor.execute("ALTER TABLE contract_additives ADD COLUMN IF NOT EXISTS decrescimo DOUBLE PRECISION DEFAULT 0.0;")
+        cursor.execute("ALTER TABLE contract_additives ADD COLUMN IF NOT EXISTS date_aditivo TEXT;")
+    except Exception:
+        pass
+        
+    try:
+        cursor.execute("ALTER TABLE contract_reajustes ADD COLUMN IF NOT EXISTS incc_initial DOUBLE PRECISION DEFAULT 0.0;")
+        cursor.execute("ALTER TABLE contract_reajustes ADD COLUMN IF NOT EXISTS incc_current DOUBLE PRECISION DEFAULT 0.0;")
+        cursor.execute("ALTER TABLE contract_reajustes ADD COLUMN IF NOT EXISTS date_reajuste TEXT;")
     except Exception:
         pass
         
@@ -713,6 +730,116 @@ if 'selected_contract_id' not in st.session_state:
     st.session_state['selected_contract_id'] = None
 
 
+
+def parse_date_safely(date_str):
+    if not date_str:
+        return None
+    clean_str = str(date_str).strip()
+    
+    # Common months mapping for data-base
+    months_map = {
+        "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+        "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+        "janei": 1, "fever": 2, "março": 3, "abril": 4, "maio": 5, "junho": 6,
+        "julho": 7, "agost": 8, "setem": 9, "outub": 10, "novem": 11, "dezem": 12
+    }
+    
+    # Try standard date formats
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(clean_str, fmt).date()
+        except ValueError:
+            continue
+            
+    # Try month/year formats like "Dez / 2024" or "MAIO/2025" or "Out/2024"
+    try:
+        parts = clean_str.replace(" ", "").split("/")
+        if len(parts) == 2:
+            m_part = parts[0].lower()
+            y_part = parts[1]
+            m_num = None
+            for k, v in months_map.items():
+                if k in m_part:
+                    m_num = v
+                    break
+            if m_num:
+                y_num = int(y_part)
+                if y_num < 100:  # 2 digits
+                    y_num += 2000
+                return date(y_num, m_num, 1)
+    except Exception:
+        pass
+    return None
+
+def calculate_reajuste_value(contract_id, r_date_str, r_index, exclude_reaj_id=None):
+    conn = get_db_connection()
+    c = conn.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+    
+    r_date = parse_date_safely(r_date_str) or date.today()
+    
+    # Fetch aditivos, measurements, other reajustes
+    additives = conn.execute("SELECT * FROM contract_additives WHERE contract_id = ?", (contract_id,)).fetchall()
+    measurements = conn.execute("SELECT * FROM contract_measurements WHERE contract_id = ?", (contract_id,)).fetchall()
+    reajustes = conn.execute("SELECT * FROM contract_reajustes WHERE contract_id = ?", (contract_id,)).fetchall()
+    conn.close()
+    
+    # Sum aditivos with date <= r_date
+    tot_aditivos = 0.0
+    for a in additives:
+        a_date_str = a.get('date_aditivo') or a.get('date') or ""
+        a_date = parse_date_safely(a_date_str)
+        if not a_date or a_date <= r_date:
+            tot_aditivos += (a.get('acrescimo', 0.0) - a.get('decrescimo', 0.0))
+            
+    # Sum measurements with date <= r_date
+    tot_meds = 0.0
+    for m in measurements:
+        m_date_str = m.get('date') or ""
+        m_date = parse_date_safely(m_date_str)
+        if not m_date or m_date <= r_date:
+            tot_meds += m.get('value', 0.0)
+            
+    # Check other reajustes before this date
+    other_reaj_before = []
+    for r in reajustes:
+        if exclude_reaj_id and r['id'] == exclude_reaj_id:
+            continue
+        r_other_date_str = r.get('date_reajuste') or ""
+        r_other_date = parse_date_safely(r_other_date_str)
+        if r_other_date and r_other_date < r_date:
+            other_reaj_before.append(r)
+            
+    if not other_reaj_before:
+        # 1º Reajuste calcular sobre o Valor total do contrato e aditivo se houver antes do 1º reajuste
+        base_value = c['value_initial'] + tot_aditivos
+    else:
+        # Do 2º Reajuste em diante: aplicado sobre o saldo restante do contrato na época
+        base_value = (c['value_initial'] + tot_aditivos) - tot_meds
+        
+    calculated_val = base_value * r_index
+    return base_value, calculated_val, tot_aditivos, tot_meds
+
+def create_endorsement_task(contract_id, event_type, event_identifier, event_date_str):
+    try:
+        conn = get_db_connection()
+        task_desc = f"Solicitar endosso da garantia devido ao {event_type} ({event_identifier}) em {event_date_str}"
+        
+        # Check if already exists to avoid duplicates
+        existing = conn.execute("SELECT id FROM contract_tasks WHERE contract_id = %s AND task_desc = %s", (contract_id, task_desc)).fetchone()
+        if not existing:
+            # Use current date + 15 days as due date
+            from datetime import timedelta
+            due_dt = (date.today() + timedelta(days=15)).strftime("%Y-%m-%d")
+            conn.execute("""
+                INSERT INTO contract_tasks (contract_id, task_desc, due_date, status, created_by)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (contract_id, task_desc, due_dt, "Pendente", "sistema"))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        pass
+
+
 def get_readjustment_alerts(c, today):
     db_str = c.get('date_base')
     if not db_str or 'os' in db_str.lower() or '/' not in db_str:
@@ -741,18 +868,48 @@ def get_readjustment_alerts(c, today):
         return []
     days_left = (next_reajuste - today).days
     
+    alerts_list = []
     if 0 < days_left <= 90:
-        return [{
-            "type": "warning" if days_left > 30 else "critical",
-            "priority": 2 if days_left > 30 else 1,
+        alert_key = f"reaj_alert_{c['id']}_{next_year}"
+        
+        if days_left <= 30:
+            card_type = "critical"
+            priority = 1
+            title = f"🚨 Reajuste Anual Crítico - {c['contract_number']}"
+            text = f"O reajuste do contrato da escola **{c['school_name']}** (Data-Base: {db_str}) vence em {days_left} dias ({next_reajuste.strftime('%d/%m/%Y')})."
+            
+            # Auto-create the task/pendência (Update 22)
+            try:
+                conn_auto = get_db_connection()
+                task_desc = f"Solicitar reajuste anual (Data-Base: {db_str})"
+                existing_auto = conn_auto.execute("SELECT id FROM contract_tasks WHERE contract_id = %s AND task_desc = %s", (c['id'], task_desc)).fetchone()
+                if not existing_auto:
+                    due_str = next_reajuste.strftime("%Y-%m-%d")
+                    conn_auto.execute("""
+                        INSERT INTO contract_tasks (contract_id, task_desc, due_date, status, created_by)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (c['id'], task_desc, due_str, "Pendente", "sistema"))
+                    conn_auto.commit()
+                conn_auto.close()
+            except Exception:
+                pass
+        else:
+            card_type = "warning"
+            priority = 2
+            title = f"📈 Reajuste Anual Próximo - {c['contract_number']}"
+            text = f"O reajuste do contrato da escola **{c['school_name']}** (Data-Base: {db_str}) está próximo ({days_left} dias)."
+            
+        alerts_list.append({
+            "type": card_type,
+            "priority": priority,
             "days_left": days_left,
             "due_date_str": next_reajuste.strftime("%d/%m/%Y"),
-            "title": f"📈 Reajuste Anual Próximo - {c['contract_number']}",
-            "text": f"O reajuste anual do contrato da escola **{c['school_name']}** (Data-Base: {db_str}) está próximo.",
-            "alert_key": f"reaj_alert_{c['id']}_{next_year}",
+            "title": title,
+            "text": text,
+            "alert_key": alert_key,
             "contract_id": c['id']
-        }]
-    return []
+        })
+    return alerts_list
 
 def check_password_strength(password):
     if len(password) < 4:
@@ -1469,8 +1626,11 @@ if st.session_state['user'] is not None:
                     ("company_cnpj", "CNPJ Empresa", c["company_cnpj"], "text"),
                     ("contract_company_id", "Contrato Empresa (ID)", c["contract_company_id"], "text"),
                     ("value_initial", "Valor Inicial (R$)", c["value_initial"], "number"),
+                    ("value_initial_obs", "Observações do Valor Inicial", c.get("value_initial_obs", "") or "", "text"),
                     ("value_offered", "Valor Ganhadora (R$)", c["value_offered"], "number"),
+                    ("value_offered_obs", "Observações do Valor Ganhadora", c.get("value_offered_obs", "") or "", "text"),
                     ("value_base_bidding", "Valor Base Edital (R$)", c["value_base_bidding"], "number"),
+                    ("value_base_bidding_obs", "Observações do Valor Base Edital", c.get("value_base_bidding_obs", "") or "", "text"),
                     ("date_base", "Data Base (Mês/Ano)", c["date_base"], "text"),
                     ("start_date", "Início Vigência", c["start_date"], "text"),
                     ("end_date", "Fim Vigência", c["end_date"], "text"),
@@ -1495,7 +1655,8 @@ if st.session_state['user'] is not None:
                         'id', 'contract_number', 'school_name', 'city', 'processo_mae', 'processo_pagamento',
                         'company_name', 'company_cnpj', 'contract_company_id', 'value_initial', 'value_offered',
                         'value_base_bidding', 'date_base', 'start_date', 'end_date', 'warranty_type',
-                        'os_date', 'os_obs', 'rao_date', 'rao_obs', 'rico_date', 'rico_obs', 'created_by', 'delegated_to', 'due_date'
+                        'os_date', 'os_obs', 'rao_date', 'rao_obs', 'rico_date', 'rico_obs', 'created_by', 'delegated_to', 'due_date',
+                        'value_initial_obs', 'value_offered_obs', 'value_base_bidding_obs'
                     }
                     custom_db_cols = [col for col in all_db_cols if col not in standard_cols]
                     
