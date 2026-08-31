@@ -453,8 +453,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Executar inicialização do banco
-init_db()
+# Executar inicialização do banco apenas se não inicializado nesta sessão do navegador (Otimização de Slowness)
+if 'db_initialized' not in st.session_state:
+    init_db()
+    st.session_state['db_initialized'] = True
 
 # --- ESTILO E CUSTOMIZAÇÃO VISUAL ---
 st.markdown("""
@@ -636,7 +638,7 @@ def create_endorsement_task(contract_id, event_type, event_identifier, event_dat
     except Exception:
         pass
 
-def get_readjustment_alerts(c, today):
+def get_readjustment_alerts(c, today, conn=None):
     db_str = c.get('date_base')
     if not db_str or 'os' in db_str.lower() or '/' not in db_str:
         return []
@@ -675,17 +677,19 @@ def get_readjustment_alerts(c, today):
             text = f"O reajuste do contrato da escola **{c['school_name']}** (Data-Base: {db_str}) vence em {days_left} dias ({next_reajuste.strftime('%d/%m/%Y')})."
             
             try:
-                conn_auto = get_db_connection()
+                active_conn = conn if conn is not None else get_db_connection()
                 task_desc = f"Solicitar reajuste anual (Data-Base: {db_str})"
-                existing_auto = conn_auto.execute("SELECT id FROM contract_tasks WHERE contract_id = %s AND task_desc = %s", (c['id'], task_desc)).fetchone()
+                existing_auto = active_conn.execute("SELECT id FROM contract_tasks WHERE contract_id = %s AND task_desc = %s", (c['id'], task_desc)).fetchone()
                 if not existing_auto:
                     due_str = next_reajuste.strftime("%Y-%m-%d")
-                    conn_auto.execute("""
+                    active_conn.execute("""
                         INSERT INTO contract_tasks (contract_id, task_desc, due_date, status, created_by)
                         VALUES (%s, %s, %s, %s, %s)
                     """, (c['id'], task_desc, due_str, "Pendente", "sistema"))
-                    conn_auto.commit()
-                conn_auto.close()
+                    if conn is None:
+                        active_conn.commit()
+                if conn is None:
+                    active_conn.close()
             except Exception:
                 pass
         else:
@@ -830,26 +834,22 @@ if st.session_state['user'] is not None:
         st.title("🏢 Painel Geral de Fiscalização de Obras")
         st.caption("Acompanhamento de prazos, garantias e inconformidades conforme a Lei 14.133/2021 e Dec. 5545-R/2023 (ES)")
         
-        # Métricas Gerais
+        # Métricas Gerais e Dados do Dashboard carregados em uma ÚNICA conexão segura (Otimização de Slowness)
         conn = get_db_connection()
         total_contracts = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
-        # Atualização 29: Usando value_contract no sum de total gerenciado
         total_val = conn.execute("SELECT SUM(value_contract) FROM contracts").fetchone()[0] or 0.0
         pending_tasks_count = conn.execute("SELECT COUNT(*) FROM contract_tasks WHERE status != 'Concluído'").fetchone()[0]
-        conn.close()
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Contratos Monitorados", total_contracts)
         col2.metric("Valor sob Gestão (Atualizado)", f"R$ {total_val:,.2f}")
         col3.metric("Pendências em Aberto", pending_tasks_count)
         
-        # Gerar Notificações Inteligentes baseadas nos prazos e regras legais
-        conn = get_db_connection()
+        # Carregar Contratos, Tarefas e Notificações com a mesma conexão aberta
         contracts = conn.execute("SELECT * FROM contracts").fetchall()
         tasks = conn.execute("SELECT t.*, c.school_name, c.contract_number FROM contract_tasks t JOIN contracts c ON t.contract_id = c.id WHERE t.status != 'Concluído'").fetchall()
         dismissed_res = conn.execute("SELECT contract_id, alert_key FROM dismissed_notifications").fetchall()
         dismissed_set = {(r['contract_id'], r['alert_key']) for r in dismissed_res}
-        conn.close()
         
         alerts = []
         today_val = date.today()
@@ -877,16 +877,13 @@ if st.session_state['user'] is not None:
                             })
                             # Inserir pendência urgente automática
                             try:
-                                conn_auto = get_db_connection()
                                 task_desc = f"Solicitar aditivo de prazo (Prazo Limite Crítico atingido em {c['due_date']})"
-                                exist_t = conn_auto.execute("SELECT id FROM contract_tasks WHERE contract_id = %s AND task_desc = %s", (c['id'], task_desc)).fetchone()
+                                exist_t = conn.execute("SELECT id FROM contract_tasks WHERE contract_id = %s AND task_desc = %s", (c['id'], task_desc)).fetchone()
                                 if not exist_t:
-                                    conn_auto.execute("""
+                                    conn.execute("""
                                         INSERT INTO contract_tasks (contract_id, task_desc, due_date, status, created_by)
                                         VALUES (%s, %s, %s, %s, %s)
                                     """, (c['id'], task_desc, due_dt.strftime("%Y-%m-%d"), "Pendente", "sistema"))
-                                    conn_auto.commit()
-                                conn_auto.close()
                             except Exception:
                                 pass
                         elif 30 < days_left_due <= 120:
@@ -937,7 +934,7 @@ if st.session_state['user'] is not None:
                     pass
 
             # Reajuste Preventivo Anual
-            reaj_alerts = get_readjustment_alerts(c, today_val)
+            reaj_alerts = get_readjustment_alerts(c, today_val, conn=conn)
             for ra in reaj_alerts:
                 if (c['id'], ra['alert_key']) not in dismissed_set:
                     alerts.append(ra)
@@ -1022,6 +1019,10 @@ if st.session_state['user'] is not None:
                         "alert_key": alert_key,
                         "contract_id": t['contract_id']
                     })
+
+        # Fechar a única conexão segura do painel de controle após o término de todas as consultas e loops (Otimização de Slowness)
+        conn.commit()
+        conn.close()
 
         # Ordenar por prioridade e proximidade
         alerts.sort(key=lambda x: (x['priority'], x['days_left']))
