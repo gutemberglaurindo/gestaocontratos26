@@ -24,7 +24,10 @@ class PostgresCursorWrapper:
         return getattr(self._cur, name)
 
     def execute(self, sql, params=None):
+        # Substituir placeholders de SQLite (?) por Postgres (%s)
         sql = sql.replace('?', '%s')
+        
+        # Para inserts (exceto na tabela users que não tem id), obter o ID inserido usando RETURNING id
         is_insert = sql.strip().upper().startswith("INSERT")
         is_users_insert = "INTO USERS" in sql.strip().upper()
         if is_insert and not is_users_insert and "RETURNING" not in sql.upper():
@@ -45,6 +48,7 @@ class PostgresCursorWrapper:
         return self
 
     def executemany(self, sql, seq_of_parameters):
+        # Substituir placeholders de SQLite (?) por Postgres (%s)
         sql = sql.replace('?', '%s')
         self._cur.executemany(sql, seq_of_parameters)
         return self
@@ -65,27 +69,44 @@ class PostgresCursorWrapper:
         return iter(self._cur)
 
 class PostgresConnectionWrapper:
-    def __init__(self, conn):
+    def __init__(self, conn, pool=None):
         self._conn = conn
+        self._pool = pool
 
     def cursor(self):
         return PostgresCursorWrapper(self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor))
 
     def commit(self):
         self._conn.commit()
+        # Invalidação dinâmica do cache do Streamlit a cada modificação na base de dados (Otimização)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
 
     def rollback(self):
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if self._pool:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        else:
+            self._conn.close()
 
     def execute(self, sql, params=None):
         cur = self.cursor()
         cur.execute(sql, params)
         return cur
 
-def get_db_connection():
+@st.cache_resource
+def get_db_pool():
+    # Otimização de Performance: Connection Pooling via st.cache_resource
     db_url = None
     if "postgres" in st.secrets:
         db_url = st.secrets["postgres"].get("url") or st.secrets["postgres"].get("pg_url")
@@ -96,8 +117,23 @@ def get_db_connection():
         st.error("🚨 DATABASE_URL não configurada! Adicione a URL do Postgres nas configurações de Secrets do Streamlit (postgres.url).")
         st.stop()
     
-    conn = psycopg2.connect(db_url)
-    return PostgresConnectionWrapper(conn)
+    from psycopg2.pool import ThreadedConnectionPool
+    return ThreadedConnectionPool(1, 20, dsn=db_url)
+
+def get_db_connection():
+    try:
+        pool = get_db_pool()
+        conn = pool.getconn()
+        return PostgresConnectionWrapper(conn, pool)
+    except Exception as e:
+        # Fallback de segurança para conexão única caso o pool não esteja disponível
+        db_url = None
+        if "postgres" in st.secrets:
+            db_url = st.secrets["postgres"].get("url") or st.secrets["postgres"].get("pg_url")
+        if not db_url:
+            db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        return PostgresConnectionWrapper(conn, None)
 
 def init_db():
     conn = get_db_connection()
@@ -311,6 +347,166 @@ def init_db():
         FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
     );
     ''')
+    # Criar Índices de Otimização (B-tree) para busca de alta performance (Evita Sequential Scan)
+    try:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_contracts_school_name ON contracts(school_name);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_contracts_city ON contracts(city);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_contracts_company_name ON contracts(company_name);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_contracts_contract_number ON contracts(contract_number);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_reajustes_date_reajuste ON contract_reajustes(date_reajuste);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_measurements_composite ON contract_measurements(contract_id, measurement_num);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status_due ON contract_tasks(status, due_date);")
+    except Exception as ei:
+        pass
+
+    # Criar Views de Otimização na Camada de Dados (Push-down Logic)
+    try:
+        cursor.execute('''
+        CREATE OR REPLACE VIEW view_contract_vigencia AS
+        SELECT
+            c.id AS contract_id,
+            c.start_date,
+            c.duration_months,
+            c.duration_days,
+            COALESCE((SELECT SUM(a.prazo_dias) FROM contract_additives a WHERE a.contract_id = c.id), 0) AS sum_additive_days,
+            (
+                CASE WHEN c.start_date IS NOT NULL AND c.start_date != '' AND c.start_date != 'vazio' THEN
+                    to_date(c.start_date, 'DD/MM/YYYY') + 
+                    (COALESCE(c.duration_months, 0) * 30 + COALESCE(c.duration_days, 0) + 
+                     COALESCE((SELECT SUM(a.prazo_dias) FROM contract_additives a WHERE a.contract_id = c.id), 0)) * INTERVAL '1 day'
+                ELSE NULL END
+            ) AS calculated_end_date,
+            (
+                CASE WHEN c.start_date IS NOT NULL AND c.start_date != '' AND c.start_date != 'vazio' THEN
+                    (to_date(c.start_date, 'DD/MM/YYYY') + 
+                    (COALESCE(c.duration_months, 0) * 30 + COALESCE(c.duration_days, 0) + 
+                     COALESCE((SELECT SUM(a.prazo_dias) FROM contract_additives a WHERE a.contract_id = c.id), 0)) * INTERVAL '1 day') - INTERVAL '121 days'
+                ELSE NULL END
+            ) AS calculated_due_date
+        FROM contracts c;
+        ''')
+    except Exception as ev1:
+        pass
+
+    try:
+        cursor.execute('''
+        CREATE OR REPLACE VIEW view_contract_values AS
+        SELECT
+            c.id AS contract_id,
+            c.value_offered,
+            COALESCE((SELECT SUM(a.acrescimo - a.decrescimo) FROM contract_additives a WHERE a.contract_id = c.id), 0.0) AS total_additives,
+            COALESCE((SELECT SUM(r.value) FROM contract_reajustes r WHERE r.contract_id = c.id), 0.0) AS total_reajustes,
+            (
+                c.value_offered + 
+                COALESCE((SELECT SUM(a.acrescimo - a.decrescimo) FROM contract_additives a WHERE a.contract_id = c.id), 0.0) +
+                COALESCE((SELECT SUM(r.value) FROM contract_reajustes r WHERE r.contract_id = c.id), 0.0)
+            ) AS calculated_contract_value
+        FROM contracts c;
+        ''')
+    except Exception as ev2:
+        pass
+
+    try:
+        cursor.execute('''
+        CREATE OR REPLACE VIEW view_contract_additives_limits AS
+        SELECT
+            c.id AS contract_id,
+            (
+                CASE WHEN UPPER(c.school_name) LIKE '%REFORMA%' 
+                       OR UPPER(c.school_name) LIKE '%REF%' 
+                       OR UPPER(c.school_name) LIKE '%RECON%' 
+                       OR UPPER(c.school_name) LIKE '%RECONSTRUÇÃO%'
+                       OR UPPER(c.contract_number) LIKE '%REFORMA%'
+                       OR UPPER(c.contract_number) LIKE '%REF%'
+                       OR UPPER(c.contract_number) LIKE '%RECON%'
+                       OR UPPER(c.contract_number) LIKE '%RECONSTRUÇÃO%'
+                THEN 'Reforma' ELSE 'Obra' END
+            ) AS contract_type,
+            (
+                CASE WHEN UPPER(c.school_name) LIKE '%REFORMA%' 
+                       OR UPPER(c.school_name) LIKE '%REF%' 
+                       OR UPPER(c.school_name) LIKE '%RECON%' 
+                       OR UPPER(c.school_name) LIKE '%RECONSTRUÇÃO%'
+                       OR UPPER(c.contract_number) LIKE '%REFORMA%'
+                       OR UPPER(c.contract_number) LIKE '%REF%'
+                       OR UPPER(c.contract_number) LIKE '%RECON%'
+                       OR UPPER(c.contract_number) LIKE '%RECONSTRUÇÃO%'
+                THEN 50.0 ELSE 25.0 END
+            ) AS limit_pct,
+            COALESCE((SELECT SUM(a.acrescimo) FROM contract_additives a WHERE a.contract_id = c.id), 0.0) AS total_acrescimos,
+            COALESCE((SELECT SUM(a.decrescimo) FROM contract_additives a WHERE a.contract_id = c.id), 0.0) AS total_decrescimos,
+            (
+                CASE WHEN c.value_offered > 0 THEN
+                    (COALESCE((SELECT SUM(a.acrescimo) FROM contract_additives a WHERE a.contract_id = c.id), 0.0) / c.value_offered) * 100.0
+                ELSE 0.0 END
+            ) AS current_acrescimo_pct
+        FROM contracts c;
+        ''')
+    except Exception as ev3:
+        pass
+
+    try:
+        cursor.execute('''
+        CREATE OR REPLACE VIEW view_contract_reajustes_base AS
+        SELECT
+            r.id AS reajuste_id,
+            r.contract_id,
+            r.num_reajuste,
+            r.index_val,
+            r.date_reajuste,
+            COALESCE((
+                SELECT SUM(a.acrescimo - a.decrescimo) 
+                FROM contract_additives a 
+                WHERE a.contract_id = r.contract_id 
+                  AND (a.date_aditivo IS NOT NULL AND a.date_aditivo != '' AND to_date(a.date_aditivo, 'DD/MM/YYYY') <= to_date(r.date_reajuste, 'DD/MM/YYYY'))
+            ), 0.0) AS prior_additives,
+            COALESCE((
+                SELECT SUM(m.value) 
+                FROM contract_measurements m 
+                WHERE m.contract_id = r.contract_id 
+                  AND (m.date IS NOT NULL AND m.date != '' AND to_date(m.date, 'DD/MM/YYYY') <= to_date(r.date_reajuste, 'DD/MM/YYYY'))
+            ), 0.0) AS prior_measurements
+        FROM contract_reajustes r;
+        ''')
+    except Exception as ev4:
+        pass
+
+    try:
+        cursor.execute('''
+        CREATE OR REPLACE VIEW view_contract_insurance AS
+        SELECT
+            c.id AS contract_id,
+            c.value_offered,
+            c.value_base_bidding,
+            (
+                CASE 
+                    WHEN c.value_base_bidding > 0 AND c.value_offered < (0.85 * c.value_base_bidding) THEN
+                        (0.05 * c.value_offered) + ((0.85 * c.value_base_bidding) - c.value_offered)
+                    ELSE
+                        (0.05 * c.value_offered)
+                END
+            ) AS initial_insurance_value,
+            COALESCE((
+                SELECT SUM(0.05 * (a.acrescimo - a.decrescimo)) FROM contract_additives a WHERE a.contract_id = c.id
+            ), 0.0) AS total_additives_endorsement,
+            COALESCE((
+                SELECT SUM(0.05 * r.value) FROM contract_reajustes r WHERE r.contract_id = c.id
+            ), 0.0) AS total_reajustes_endorsement,
+            (
+                (CASE 
+                    WHEN c.value_base_bidding > 0 AND c.value_offered < (0.85 * c.value_base_bidding) THEN
+                        (0.05 * c.value_offered) + ((0.85 * c.value_base_bidding) - c.value_offered)
+                    ELSE
+                        (0.05 * c.value_offered)
+                END) +
+                COALESCE((SELECT SUM(0.05 * (a.acrescimo - a.decrescimo)) FROM contract_additives a WHERE a.contract_id = c.id), 0.0) +
+                COALESCE((SELECT SUM(0.05 * r.value) FROM contract_reajustes r WHERE r.contract_id = c.id), 0.0)
+            ) AS total_insurance_value
+        FROM contracts c;
+        ''')
+    except Exception as ev5:
+        pass
+
 
     # Seed de Usuários Padrão
     cursor.execute("SELECT COUNT(*) FROM users")
@@ -487,6 +683,7 @@ if 'selected_contract_id' not in st.session_state:
 if 'persisted_contract_id' not in st.session_state:
     st.session_state['persisted_contract_id'] = None
 
+@st.cache_data
 def parse_date_safely(date_str):
     if not date_str:
         return None
@@ -521,6 +718,7 @@ def parse_date_safely(date_str):
         pass
     return None
 
+@st.cache_data
 def calculate_contract_dates(start_date_str, duration_months, duration_days, sum_additive_days):
     try:
         start_date = datetime.strptime(start_date_str.strip(), "%d/%m/%Y").date()
@@ -530,6 +728,34 @@ def calculate_contract_dates(start_date_str, duration_months, duration_days, sum
     end_date = start_date + timedelta(days=total_days)
     due_date = end_date - timedelta(days=120)  # 4 meses antes do término
     return end_date.strftime("%d/%m/%Y"), due_date.strftime("%d/%m/%Y")
+
+@st.cache_data
+def get_contract_value_chain_cached(contract_id):
+    conn = get_db_connection()
+    c = conn.execute("SELECT * FROM contracts WHERE id = %s", (contract_id,)).fetchone()
+    additives = conn.execute("SELECT * FROM contract_additives WHERE contract_id = %s", (contract_id,)).fetchall()
+    reajustes = conn.execute("SELECT * FROM contract_reajustes WHERE contract_id = %s", (contract_id,)).fetchall()
+    conn.close()
+    
+    c_dict = dict(c) if c else {}
+    additives_list = [dict(a) for a in additives]
+    reajustes_list = [dict(r) for r in reajustes]
+    return get_contract_value_chain(c_dict, additives_list, reajustes_list)
+
+@st.cache_data
+def calculate_reajuste_value_cached(contract_id, r_date_str, r_index, exclude_reaj_id=None):
+    return calculate_reajuste_value(contract_id, r_date_str, r_index, exclude_reaj_id)
+
+@st.cache_data
+def get_readjustment_alerts_cached(contract_id, today_str):
+    conn = get_db_connection()
+    c = conn.execute("SELECT * FROM contracts WHERE id = %s", (contract_id,)).fetchone()
+    conn.close()
+    if not c:
+        return []
+    import datetime
+    today_val = datetime.datetime.strptime(today_str, "%Y-%m-%d").date()
+    return get_readjustment_alerts(dict(c), today_val)
 
 def get_contract_value_chain(c, additives, reajustes):
     base_val = c.get('value_offered') or 0.0
@@ -1397,7 +1623,7 @@ if st.session_state['user'] is not None:
                         
                     # Se for campo de fórmula-histórico de valor de contrato
                     if f_type == "formula_chain":
-                        current_c_val, formula_steps = get_contract_value_chain(c, additives, reajustes)
+                        current_c_val, formula_steps = get_contract_value_chain_cached(selected_contract_id)
                         col_val.markdown("<br/>".join(formula_steps), unsafe_allow_html=True)
                         
                         # Atualização 32 & 33: Atualizar na base de dados
@@ -1834,7 +2060,7 @@ if st.session_state['user'] is not None:
                             st.info(f"📊 **Índice Calculado (INCC):** {calc_index:.7f} ({calc_index*100:.2f}%)")
                             
                             # Obter base de cálculo de acordo com ordem cronológica de reajustes
-                            base_value, calculated_reaj_val, tot_add, tot_meds = calculate_reajuste_value(selected_contract_id, r_date, calc_index)
+                            base_value, calculated_reaj_val, tot_add, tot_meds = calculate_reajuste_value_cached(selected_contract_id, r_date, calc_index)
                             
                             st.write(f"**Valor Inicial (Ofertado):** R$ {c['value_offered']:,.2f}")
                             st.write(f"**Total de Aditivos anteriores à data:** R$ {tot_add:,.2f}")
@@ -1888,7 +2114,7 @@ if st.session_state['user'] is not None:
                                     else:
                                         new_index = (new_reaj_curr_incc - new_reaj_init_incc) / new_reaj_init_incc if new_reaj_init_incc > 0 else 0.0
                                         # Recalcular valor
-                                        base_value, new_reaj_val, tot_add, tot_meds = calculate_reajuste_value(selected_contract_id, new_reaj_date, new_index, exclude_reaj_id=selected_reaj_id)
+                                        base_value, new_reaj_val, tot_add, tot_meds = calculate_reajuste_value_cached(selected_contract_id, new_reaj_date, new_index, exclude_reaj_id=selected_reaj_id)
                                         conn.execute("""
                                             UPDATE contract_reajustes 
                                             SET num_reajuste = %s, index_val = %s, value = %s, obs = %s, incc_initial = %s, incc_current = %s, date_reajuste = %s
