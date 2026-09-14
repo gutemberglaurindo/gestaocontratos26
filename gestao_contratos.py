@@ -1,3 +1,226 @@
+PROMPT_REPLICACAO_IA_TXT = """================================================================================
+PROMPT DE REPLICAÇÃO INTEGRAL DO APLICATIVO "GESTÃO DE CONTRATOS" (SEDU/ES)
+LEI FEDERAL Nº 14.133/2021 E DECRETO ESTADUAL Nº 5545-R/2023 (ES)
+================================================================================
+
+[VISÃO GERAL DO PROJETO]
+Você é um Engenheiro de Software Sênior e Arquiteto de Dados. Sua missão é construir ou replicar do zero um sistema WEB completo para Gestão e Fiscalização de Contratos de Obras e Reformas Públicas, atendendo aos parâmetros, prazos e atividades impostas pela Lei de Licitações nº 14.133/2021 e pelo Decreto Estadual nº 5545-R/2023 do Espírito Santo.
+
+O sistema deve ser desenvolvido em Python com a biblioteca Streamlit e conectado a um banco de dados PostgreSQL na nuvem (como o Supabase). O foco principal é a gestão preventiva de prazos, aditivos, reajustes pelo INCC, seguros garantia, medições e alertas de inconformidade para Fiscais e Gestores de Obras.
+
+--------------------------------------------------------------------------------
+1. PERFIS E AUTORIZAÇÕES DE USUÁRIO (RBAC - Role-Based Access Control)
+--------------------------------------------------------------------------------
+- DEVELOPER (Desenvolvedor): Apenas o primeiro usuário do sistema. Tem acesso total a todos os contratos e pode promover novos usuários para o perfil DEVELOPER através de convite.
+- CREATOR (Criador / Gestor): Usuário que adicionou o contrato. Possui permissão exclusiva de edição, edição de equipe, lançamento de aditivos/reajustes, exclusão e alteração de prazos. Pode delegar autorização para outros usuários.
+- PARTICIPANT (Participante / Fiscal / Apoio): Usuário vinculado ao contrato. Possui permissão de visualização e navegação de relatórios.
+
+--------------------------------------------------------------------------------
+2. ESQUEMA COMPLETO DO BANCO DE DADOS POSTGRESQL (SUPABASE)
+--------------------------------------------------------------------------------
+-- Tabela de Usuários
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password TEXT NOT NULL,
+    role TEXT NOT NULL, -- 'DEVELOPER', 'CREATOR', 'PARTICIPANT'
+    pref_area TEXT NOT NULL, -- 'Engenharia Civil', 'Engenharia Elétrica', etc.
+    email TEXT NOT NULL
+);
+
+-- Tabela Principal de Contratos
+CREATE TABLE IF NOT EXISTS contracts (
+    id SERIAL PRIMARY KEY,
+    contract_number TEXT NOT NULL,
+    school_name TEXT NOT NULL,
+    city TEXT NOT NULL,
+    processo_mae TEXT NOT NULL,
+    processo_pagamento TEXT,
+    company_name TEXT NOT NULL,
+    company_cnpj TEXT,
+    contract_company_id TEXT,
+    value_initial DOUBLE PRECISION NOT NULL,
+    value_offered DOUBLE PRECISION NOT NULL,
+    value_base_bidding DOUBLE PRECISION,
+    date_base TEXT,
+    start_date TEXT,
+    end_date TEXT,
+    warranty_type TEXT,
+    os_date TEXT,
+    os_obs TEXT,
+    rao_date TEXT,
+    rao_obs TEXT,
+    rico_date TEXT,
+    rico_obs TEXT,
+    created_by TEXT,
+    delegated_to TEXT,
+    due_date TEXT, -- Prazo Limite (4 meses antes do término)
+    duration_months DOUBLE PRECISION DEFAULT 0.0,
+    duration_days INTEGER DEFAULT 0,
+    value_contract DOUBLE PRECISION, -- Valor Atualizado do Contrato
+    process_piece_map TEXT,
+    value_initial_obs TEXT,
+    value_offered_obs TEXT,
+    value_base_bidding_obs TEXT,
+    FOREIGN KEY (created_by) REFERENCES users(username)
+);
+
+-- Tabela de Equipe do Contrato
+CREATE TABLE IF NOT EXISTS contract_roles (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    username TEXT,
+    role_type TEXT NOT NULL, -- 'Gestor', 'Fiscal', 'Apoio'
+    area TEXT,
+    start_date TEXT,
+    end_date TEXT,
+    email TEXT,
+    obs TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+-- Tabela de Termos Aditivos
+CREATE TABLE IF NOT EXISTS contract_additives (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    value DOUBLE PRECISION,
+    date TEXT,
+    prazo_dias INTEGER,
+    obs TEXT,
+    acrescimo DOUBLE PRECISION DEFAULT 0.0,
+    decrescimo DOUBLE PRECISION DEFAULT 0.0,
+    date_aditivo TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+-- Tabela de Reajustes Contratuais (INCC)
+CREATE TABLE IF NOT EXISTS contract_reajustes (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    num_reajuste TEXT,
+    index_val DOUBLE PRECISION,
+    value DOUBLE PRECISION,
+    obs TEXT,
+    incc_initial DOUBLE PRECISION DEFAULT 0.0,
+    incc_current DOUBLE PRECISION DEFAULT 0.0,
+    date_reajuste TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+-- Tabela de Medições Realizadas
+CREATE TABLE IF NOT EXISTS contract_measurements (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    measurement_num INTEGER,
+    date TEXT,
+    value DOUBLE PRECISION,
+    value_reajuste DOUBLE PRECISION,
+    balance DOUBLE PRECISION,
+    obs TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+-- Tabela de Pendências de Obra e Tarefas
+CREATE TABLE IF NOT EXISTS contract_tasks (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    task_desc TEXT NOT NULL,
+    due_date TEXT,
+    status TEXT NOT NULL, -- 'Pendente', 'Em andamento', 'Concluído'
+    created_by TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+-- Tabela de Histórico de Auditoria (Ações MODIFICAR, SUBSTITUIR, EXCLUIR)
+CREATE TABLE IF NOT EXISTS contract_history (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    field_name TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    modified_by TEXT,
+    modified_at TEXT,
+    modification_type TEXT NOT NULL, -- 'MODIFICAR', 'SUBSTITUIR', 'EXCLUIR'
+    initial_date TEXT,
+    process_piece TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+-- Tabela de Rótulos Personalizados
+CREATE TABLE IF NOT EXISTS custom_field_labels (
+    column_name TEXT PRIMARY KEY,
+    label TEXT NOT NULL
+);
+
+-- Tabela de Notificações Encerradas
+CREATE TABLE IF NOT EXISTS dismissed_notifications (
+    id SERIAL PRIMARY KEY,
+    contract_id INTEGER,
+    alert_key TEXT NOT NULL,
+    dismissed_by TEXT,
+    dismissed_at TEXT,
+    FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+);
+
+--------------------------------------------------------------------------------
+3. REGRAS DE NEGÓCIO E MOTORES DE CÁLCULO
+--------------------------------------------------------------------------------
+1. CÁLCULO DE VIGÊNCIA E PRAZO LIMITE:
+   - Data Final = Data de Início + (Meses * 30.4375 + Dias Extras + Aditivos de Prazo).
+   - Prazo Limite = Data Final - 120 dias (4 meses antes do término de vigência).
+   - Quando o prazo limite fica <= 30 dias, gera automaticamente notificação vermelha (Crítica) e insere uma pendência urgente na fila do contrato.
+
+2. CÁLCULO DO VALOR DO CONTRATO:
+   - Valor do Contrato = Valor Ofertado (Proposta Ganhadora) + Sum(Acréscimos - Decréscimos de Aditivos) + Sum(Reajustes).
+   - O histórico de alterações do valor é exibido no formato:
+     ~~Valor Anterior~~ + R$ Reajustes + R$ Aditivos = Valor Atualizado.
+
+3. LIMITES LEGAIS DE ADITIVOS (LEI 14.133/2021):
+   - Obras Comuns: Limite legal de 25% do valor inicial.
+   - Reformas (identificadas por 'REFORMA', 'REF', 'RECON'): Limite legal de 50% do valor inicial.
+   - O sistema dispara notificação de alerta amarelo/vermelho quando os aditivos acumulados atingem a tolerância de 5% antes do limite legal.
+   - O valor global do aditivo (Acréscimo - Decréscimo) é exibido com a mensagem explicativa: "Valor Global apenas para fim de Reajuste. Não compensar Acréscimo com Decréscimo (Lei 14.133/2021)".
+
+4. CÁLCULO DE REAJUSTE PELO INCC (NÃO CUMULATIVO):
+   - Índice INCC = (INCC_Ano_Reajuste - INCC_Ano_Inicial) / INCC_Ano_Inicial.
+   - 1º Reajuste: Calculado sobre (Valor Ofertado + Aditivos Anteriores à data do reajuste).
+   - 2º Reajuste em diante: Calculado sobre ((Valor Ofertado + Aditivos Anteriores) - Medições Realizadas até a data do reajuste), descontando reajustes anteriores para não haver reajuste sobre reajuste.
+   - O lançamento de qualquer aditivo ou reajuste gera automaticamente uma pendência de "Solicitar endosso da garantia".
+
+5. SEGURO GARANTIA E ENDOSSOS (ART. 96, § 5º LEI 14.133/2021):
+   - Se Valor Ofertado >= 85% do Valor do Edital: Garantia = 5% do Valor Ofertado.
+   - Se Valor Ofertado < 85% do Valor do Edital: Garantia = (5% do Valor Ofertado) + (85% do Valor do Edital - Valor Ofertado).
+   - Cada aditivo e reajuste gera endossos calculados separadamente.
+
+6. NOTIFICAÇÕES E ALERTAS COLORIDOS:
+   - Vermelho (Crítico): Vencimentos <= 30 dias, Prazos Limite <= 30 dias.
+   - Laranja (Alerta): Vencimentos de 31 a 90 dias, Prazos Limite de 31 a 120 dias, Seguro Garantia pendente.
+   - Azul (Informativo): Prazos confortáveis (> 90 dias) e tarefas ativas regulares.
+
+--------------------------------------------------------------------------------
+4. OPERAÇÕES DE AUDITORIA (MODIFICAR, SUBSTITUIR, EXCLUIR)
+--------------------------------------------------------------------------------
+- MODIFICAR: Atualiza o valor mantendo o dado anterior visível e riscado (com tag strikethrough), registrando quem alterou, a data e a Peça do Processo/E-Docs.
+- SUBSTITUIR: Substitui o dado e remove o histórico antigo. Exige confirmação de mensagem de alerta ("⚠️ Ao confirmar os dados anteriores desse item serão perdidos") e digitação obrigatória de senha.
+- EXCLUIR: Apaga o dado. Exige a mesma confirmação com aviso de perda e senha.
+
+--------------------------------------------------------------------------------
+5. RELATÓRIOS EXCEL GERADOS (.XLSX)
+--------------------------------------------------------------------------------
+O sistema gera uma planilha em Excel com 3 abas dinâmicas:
+1. Aba "Resumo Geral Contratos": Tabela com 1ª coluna = Nome do Contrato, 2ª a 4ª colunas = Próximas 3 Pendências mais urgentes (com preenchimento de cor vermelha, laranja ou azul), seguidas por todas as colunas cadastrais e financeiras.
+2. Aba "Detalhamento por Contrato": Lista suspensa na célula B2 com todos os contratos. Ao selecionar, carrega a ficha técnica e traz em primeiro lugar a seção de pendências destacadas por cor.
+3. Aba "Medições por Contrato": Lista suspensa na célula B2. Ao selecionar, traz a grade das 12 medições mensais (com VLOOKUPs automáticos) e o total medido.
+
+--------------------------------------------------------------------------------
+6. REQUISITOS TÉCNICOS E CONEXÃO POSTGRES
+--------------------------------------------------------------------------------
+- Utilizar `psycopg2-binary` com `ThreadedConnectionPool` e fallback para conexões diretas via SSL (`sslmode=require&connect_timeout=10&keepalives=1`).
+- Tratamento resiliente contra erros `psycopg2.OperationalError` com retries automáticos e validação `SELECT 1;`.
+- Usar `st.cache_resource` para manter o pool aberto e `st.cache_data.clear()` a cada commit.
+
+================================================================================
+"""
+
 # -*- coding: utf-8 -*-
 import streamlit as st
 import psycopg2
@@ -113,9 +336,20 @@ class PostgresConnectionWrapper:
         cur.execute(sql, params)
         return cur
 
+def prepare_db_url(raw_url):
+    if not raw_url:
+        return raw_url
+    url = raw_url.strip()
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}sslmode=require"
+    if "connect_timeout=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}connect_timeout=10"
+    return url
+
 @st.cache_resource
 def get_db_pool():
-    # Otimização de Performance: Connection Pooling via st.cache_resource
     db_url = None
     if "postgres" in st.secrets:
         db_url = st.secrets["postgres"].get("url") or st.secrets["postgres"].get("pg_url")
@@ -126,23 +360,51 @@ def get_db_pool():
         st.error("🚨 DATABASE_URL não configurada! Adicione a URL do Postgres nas configurações de Secrets do Streamlit (postgres.url).")
         st.stop()
     
+    db_url = prepare_db_url(db_url)
     from psycopg2.pool import ThreadedConnectionPool
-    return ThreadedConnectionPool(1, 20, dsn=db_url)
+    return ThreadedConnectionPool(1, 15, dsn=db_url)
 
 def get_db_connection():
-    try:
-        pool = get_db_pool()
-        conn = pool.getconn()
-        return PostgresConnectionWrapper(conn, pool)
-    except Exception as e:
-        # Fallback de segurança para conexão única caso o pool não esteja disponível
-        db_url = None
-        if "postgres" in st.secrets:
-            db_url = st.secrets["postgres"].get("url") or st.secrets["postgres"].get("pg_url")
-        if not db_url:
-            db_url = os.environ.get("DATABASE_URL")
-        conn = psycopg2.connect(db_url)
-        return PostgresConnectionWrapper(conn, None)
+    db_url = None
+    if "postgres" in st.secrets:
+        db_url = st.secrets["postgres"].get("url") or st.secrets["postgres"].get("pg_url")
+    if not db_url:
+        db_url = os.environ.get("DATABASE_URL")
+    
+    if db_url:
+        db_url = prepare_db_url(db_url)
+        
+    for attempt in range(3):
+        try:
+            pool = get_db_pool()
+            conn = pool.getconn()
+            if conn and conn.closed == 0:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1;")
+                    return PostgresConnectionWrapper(conn, pool)
+                except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                    try:
+                        pool.putconn(conn, close=True)
+                    except Exception:
+                        pass
+            conn = psycopg2.connect(db_url, sslmode="require", connect_timeout=10, keepalives=1)
+            return PostgresConnectionWrapper(conn, None)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            if attempt < 2:
+                import time
+                time.sleep(0.5)
+                try:
+                    get_db_pool.clear()
+                except Exception:
+                    pass
+            else:
+                try:
+                    conn = psycopg2.connect(db_url, sslmode="require", connect_timeout=10, keepalives=1)
+                    return PostgresConnectionWrapper(conn, None)
+                except Exception as final_e:
+                    st.error(f"🚨 Erro de Conexão com o Supabase (OperationalError): {final_e}. Verifique a URL em Secrets e se o banco Supabase está ativo.")
+                    st.stop()
 
 def init_db():
     conn = get_db_connection()
@@ -660,8 +922,16 @@ def init_db():
 
 # Executar inicialização do banco apenas se não inicializado nesta sessão do navegador (Otimização de Slowness)
 if 'db_initialized' not in st.session_state:
-    init_db()
-    st.session_state['db_initialized'] = True
+    try:
+        init_db()
+        st.session_state['db_initialized'] = True
+    except Exception as e_init:
+        st.warning(f"Aviso de Inicialização do Banco: {e_init}. Tentando reconexão...")
+        try:
+            init_db()
+            st.session_state['db_initialized'] = True
+        except Exception:
+            pass
 
 # --- ESTILO E CUSTOMIZAÇÃO VISUAL ---
 st.markdown("""
@@ -1659,7 +1929,11 @@ def generate_excel_report(contracts_list, tasks_list, additives_list, reajustes_
         col2.metric("Valor sob Gestão (Atualizado)", f"R$ {total_val:,.2f}")
         col3.metric("Pendências em Aberto", pending_tasks_count)
         
-        # Botão de Exportação de Planilha Excel Completa (Atualização 38)
+        # Carregar Contratos, Tarefas e Notificações com a mesma conexão aberta
+        contracts = conn.execute("SELECT * FROM contracts").fetchall()
+        tasks = conn.execute("SELECT t.*, c.school_name, c.contract_number FROM contract_tasks t JOIN contracts c ON t.contract_id = c.id WHERE t.status != 'Concluído'").fetchall()
+        
+        # Seção de Exportação de Dados e Réplica do Aplicativo (Atualizações 38 & 39)
         try:
             additives_all = conn.execute("SELECT * FROM contract_additives").fetchall()
             reajustes_all = conn.execute("SELECT * FROM contract_reajustes").fetchall()
@@ -1670,26 +1944,39 @@ def generate_excel_report(contracts_list, tasks_list, additives_list, reajustes_
             excel_bytes = generate_excel_report(contracts, tasks, additives_all, reajustes_all, measurements_all, roles_all, history_all)
             
             st.markdown("<br/>", unsafe_allow_html=True)
-            col_ex1, col_ex2 = st.columns([3, 1])
+            st.markdown("##### 📥 Exportações, Relatórios e Réplica do Aplicativo para IA (Atualizações 38 & 39)")
+            col_ex1, col_ex2, col_ex3 = st.columns(3)
+            
             with col_ex1:
-                st.markdown("##### 📊 Relatório Geral e Fichas de Contratos (Excel .xlsx)")
-                st.caption("Planilha editável em 3 abas contendo o resumo dos contratos, fichas individuais por urgência e acompanhamento de medições.")
-            with col_ex2:
                 st.download_button(
-                    label="📊 Baixar Planilha Excel (.xlsx)",
-                    data=excel_bytes,
+                    label="📊 Baixar Relatório Excel (.xlsx)",
+                    data=excel_bytes if excel_bytes else b"",
                     file_name=f"Gestao_Contratos_SEDU_ES_{date.today().strftime('%d_%m_%Y')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="btn_download_excel_dashboard_v14",
+                    key="btn_download_excel_dash_v16",
+                    use_container_width=True
+                )
+            with col_ex2:
+                py_code_str = code
+                st.download_button(
+                    label="💻 Baixar Código Fonte App (.py)",
+                    data=py_code_str.encode('utf-8'),
+                    file_name="gestao_contratos.py",
+                    mime="text/x-python",
+                    key="btn_download_py_code_v16",
+                    use_container_width=True
+                )
+            with col_ex3:
+                st.download_button(
+                    label="🤖 Baixar Prompt Replicação IA (.txt)",
+                    data=PROMPT_REPLICACAO_IA_TXT.encode('utf-8'),
+                    file_name="prompt_replicacao_ia_gestao_contratos.txt",
+                    mime="text/plain",
+                    key="btn_download_prompt_ia_v16",
                     use_container_width=True
                 )
         except Exception as e_excel:
-            st.caption(f"Nota: Carregamento do relatório Excel disponível após inicialização ({e_excel})")
-
-        
-        # Carregar Contratos, Tarefas e Notificações com a mesma conexão aberta
-        contracts = conn.execute("SELECT * FROM contracts").fetchall()
-        tasks = conn.execute("SELECT t.*, c.school_name, c.contract_number FROM contract_tasks t JOIN contracts c ON t.contract_id = c.id WHERE t.status != 'Concluído'").fetchall()
+            st.caption(f"Nota: Opções de exportação inicializadas ({e_excel})")
         dismissed_res = conn.execute("SELECT contract_id, alert_key FROM dismissed_notifications").fetchall()
         dismissed_set = {(r['contract_id'], r['alert_key']) for r in dismissed_res}
         
