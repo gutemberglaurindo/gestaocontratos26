@@ -1301,34 +1301,6 @@ if st.session_state['user'] is None:
     st.code("Desenvolvedor -> Usuário: desenvolvedor / Senha: Dev@123\nCriador Geral -> Usuário: gestor_es / Senha: Gestor@123\nParticipante -> Usuário: fiscal_es / Senha: Fiscal@123")
     st.stop()
 
-# --- SESSÃO DO USUÁRIO LOGADO ---
-if st.session_state['user'] is not None:
-    current_user = st.session_state['username']
-    current_role = st.session_state['role']
-
-    # BARRA LATERAL (SIDEBAR)
-    with st.sidebar:
-        st.markdown(f"### 👤 {current_user.upper()}")
-        st.caption(f"Perfil: {current_role}")
-        
-        st.markdown("---")
-        menu = st.sidebar.radio("Navegação", [
-            "📊 Painel de Controle",
-            "📂 Adicionar Contrato",
-            "🔍 Visualizar/Editar Contratos",
-            "🔧 Meu Perfil"
-        ])
-        
-        st.markdown("---")
-        if st.sidebar.button("🚪 Sair"):
-            st.session_state['user'] = None
-            st.session_state['role'] = None
-            st.session_state['username'] = None
-            st.session_state['selected_contract_id'] = None
-            st.session_state['persisted_contract_id'] = None
-            st.rerun()
-
-
 def generate_excel_report(contracts_list, tasks_list, additives_list, reajustes_list, measurements_list, roles_list, history_list):
     if not HAS_OPENPYXL:
         st.error("🚨 O pacote 'openpyxl' não está instalado no seu ambiente do Streamlit Cloud. Por favor, atualize o arquivo 'requirements.txt' no GitHub adicionando a linha 'openpyxl'.")
@@ -1906,6 +1878,36 @@ def generate_excel_report(contracts_list, tasks_list, additives_list, reajustes_
     wb.save(output)
     output.seek(0)
     return output.getvalue()
+
+
+# --- SESSÃO DO USUÁRIO LOGADO ---
+if st.session_state['user'] is not None:
+    current_user = st.session_state['username']
+    current_role = st.session_state['role']
+
+    # BARRA LATERAL (SIDEBAR)
+    with st.sidebar:
+        st.markdown(f"### 👤 {current_user.upper()}")
+        st.caption(f"Perfil: {current_role}")
+        
+        st.markdown("---")
+        menu = st.sidebar.radio("Navegação", [
+            "📊 Painel de Controle",
+            "📂 Adicionar Contrato",
+            "🔍 Visualizar/Editar Contratos",
+            "🔧 Meu Perfil"
+        ])
+        
+        st.markdown("---")
+        if st.sidebar.button("🚪 Sair"):
+            st.session_state['user'] = None
+            st.session_state['role'] = None
+            st.session_state['username'] = None
+            st.session_state['selected_contract_id'] = None
+            st.session_state['persisted_contract_id'] = None
+            st.rerun()
+
+
 
     def get_registered_users():
         conn = get_db_connection()
