@@ -5,7 +5,12 @@ import psycopg2.extras
 import os
 import json
 import re
+import io
 from datetime import datetime, date, timedelta
+import openpyxl
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # Configuração da página do Streamlit
 st.set_page_config(
@@ -1049,6 +1054,582 @@ if st.session_state['user'] is not None:
             st.session_state['persisted_contract_id'] = None
             st.rerun()
 
+
+def generate_excel_report(contracts_list, tasks_list, additives_list, reajustes_list, measurements_list, roles_list, history_list):
+    wb = openpyxl.Workbook()
+    today_val = date.today()
+    
+    font_title = Font(name="Segoe UI", size=14, bold=True, color="1E3A8A")
+    font_header = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    font_bold = Font(name="Segoe UI", size=10, bold=True)
+    font_normal = Font(name="Segoe UI", size=10)
+    
+    fill_navy = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    fill_blue_header = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
+    fill_card_header = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+    
+    fill_red = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+    font_red = Font(name="Segoe UI", size=10, bold=True, color="991B1B")
+    
+    fill_orange = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+    font_orange = Font(name="Segoe UI", size=10, bold=True, color="92400E")
+    
+    fill_blue = PatternFill(start_color="E0F2FE", end_color="E0F2FE", fill_type="solid")
+    font_blue = Font(name="Segoe UI", size=10, bold=True, color="075985")
+    
+    border_thin = Border(
+        left=Side(style='thin', color='CBD5E1'),
+        right=Side(style='thin', color='CBD5E1'),
+        top=Side(style='thin', color='CBD5E1'),
+        bottom=Side(style='thin', color='CBD5E1')
+    )
+    
+    # Maps
+    contract_tasks_map = {}
+    for t in tasks_list:
+        cid = t['contract_id']
+        contract_tasks_map.setdefault(cid, []).append(t)
+        
+    contract_additives_map = {}
+    for a in additives_list:
+        cid = a['contract_id']
+        contract_additives_map.setdefault(cid, []).append(a)
+        
+    contract_reajustes_map = {}
+    for r in reajustes_list:
+        cid = r['contract_id']
+        contract_reajustes_map.setdefault(cid, []).append(r)
+        
+    contract_measurements_map = {}
+    for m in measurements_list:
+        cid = m['contract_id']
+        contract_measurements_map.setdefault(cid, []).append(m)
+        
+    contract_roles_map = {}
+    for ro in roles_list:
+        cid = ro['contract_id']
+        contract_roles_map.setdefault(cid, []).append(ro)
+
+    # -------------------------------------------------------------
+    # HELPER SHEET: _Dados_Ref
+    # -------------------------------------------------------------
+    ws_ref = wb.active
+    ws_ref.title = "_Dados_Ref"
+    
+    ref_headers = [
+        "Contract_Label", "ID", "N_Contrato", "Escola", "Municipio", "Empresa", "CNPJ", "Contrato_Empresa",
+        "Processo_Mae", "Processo_Pagamento", "Valor_Proposta", "Valor_Atual_Contrato", "Valor_Edital",
+        "Data_Base", "Inicio_Vigencia", "Fim_Vigencia", "Prazo_Limite", "Duracao_Meses", "Duracao_Dias",
+        "Tipo_Garantia", "Valor_Garantia_Calc", "Total_Aditivos", "Total_Reajustes", "Gestor_Fiscal",
+        "Pendencia_1", "Pendencia_1_Urgencia", "Pendencia_2", "Pendencia_2_Urgencia", "Pendencia_3", "Pendencia_3_Urgencia",
+        "Todas_Pendencias_Texto"
+    ]
+    ws_ref.append(ref_headers)
+    
+    contract_labels = []
+    
+    for c in contracts_list:
+        cid = c['id']
+        c_label = f"{c['contract_number']} - {c['school_name']}"
+        contract_labels.append(c_label)
+        
+        c_tasks = [t for t in contract_tasks_map.get(cid, []) if t.get('status') != 'Concluído']
+        formatted_tasks = []
+        for t in c_tasks:
+            due_str = t.get('due_date') or ""
+            days_left = 999
+            urgency = "BLUE"
+            if due_str:
+                try:
+                    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                        try:
+                            dt = datetime.strptime(due_str.strip(), fmt).date()
+                            days_left = (dt - today_val).days
+                            due_str_br = dt.strftime("%d/%m/%Y")
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        due_str_br = due_str
+                except Exception:
+                    due_str_br = due_str
+                    
+                if days_left <= 30:
+                    urgency = "RED"
+                elif 30 < days_left <= 90:
+                    urgency = "ORANGE"
+                else:
+                    urgency = "BLUE"
+            else:
+                due_str_br = "Sem Prazo"
+                urgency = "BLUE"
+                
+            formatted_tasks.append({
+                'desc': t.get('task_desc', ''),
+                'due': due_str_br,
+                'days_left': days_left,
+                'urgency': urgency,
+                'text': f"{t.get('task_desc', '')} (Prazo: {due_str_br})"
+            })
+            
+        formatted_tasks.sort(key=lambda x: (0 if x['urgency']=='RED' else (1 if x['urgency']=='ORANGE' else 2), x['days_left']))
+        
+        p1_text = formatted_tasks[0]['text'] if len(formatted_tasks) > 0 else "Nenhuma pendência"
+        p1_urg = formatted_tasks[0]['urgency'] if len(formatted_tasks) > 0 else "NONE"
+        
+        p2_text = formatted_tasks[1]['text'] if len(formatted_tasks) > 1 else ""
+        p2_urg = formatted_tasks[1]['urgency'] if len(formatted_tasks) > 1 else "NONE"
+        
+        p3_text = formatted_tasks[2]['text'] if len(formatted_tasks) > 2 else ""
+        p3_urg = formatted_tasks[2]['urgency'] if len(formatted_tasks) > 2 else "NONE"
+        
+        newline_char = "\n"
+        all_p_str = newline_char.join([f"• [{ft['urgency']}] {ft['text']}" for ft in formatted_tasks]) or "Nenhuma pendência ativa."
+        
+        c_adds = contract_additives_map.get(cid, [])
+        c_reajs = contract_reajustes_map.get(cid, [])
+        tot_adds = sum([(a.get('acrescimo', 0.0) or 0.0) - (a.get('decrescimo', 0.0) or 0.0) for a in c_adds])
+        tot_reajs = sum([r.get('value', 0.0) or 0.0 for r in c_reajs])
+        val_offered = c.get('value_offered') or c.get('value_initial') or 0.0
+        val_contract = c.get('value_contract') or (val_offered + tot_adds + tot_reajs)
+        
+        c_roles = contract_roles_map.get(cid, [])
+        roles_str = ", ".join([f"{r.get('username','')} ({r.get('role_type','')})" for r in c_roles]) or "Não atribuído"
+        
+        v_edital = c.get('value_base_bidding') or 0.0
+        if v_edital > 0 and val_offered < (0.85 * v_edital):
+            garantia_val = (0.05 * val_offered) + ((0.85 * v_edital) - val_offered)
+        else:
+            garantia_val = 0.05 * val_offered
+            
+        dur_str = f"{c.get('duration_months',0)}m / {c.get('duration_days',0)}d"
+        
+        row_data = [
+            c_label, cid, c.get('contract_number',''), c.get('school_name',''), c.get('city',''),
+            c.get('company_name',''), c.get('company_cnpj',''), c.get('contract_company_id',''),
+            c.get('processo_mae',''), c.get('processo_pagamento',''), val_offered, val_contract, v_edital,
+            c.get('date_base',''), c.get('start_date',''), c.get('end_date',''), c.get('due_date',''),
+            c.get('duration_months', 0), c.get('duration_days', 0), c.get('warranty_type',''),
+            garantia_val, tot_adds, tot_reajs, roles_str,
+            p1_text, p1_urg, p2_text, p2_urg, p3_text, p3_urg, all_p_str
+        ]
+        ws_ref.append(row_data)
+
+    # -------------------------------------------------------------
+    # ABA 1: Resumo Geral
+    # -------------------------------------------------------------
+    ws1 = wb.create_sheet(title="Resumo Geral Contratos", index=0)
+    ws1.views.sheetView[0].showGridLines = True
+    
+    ws1.merge_cells("A1:W1")
+    ws1["A1"] = "🏢 SISTEMA DE GESTÃO DE CONTRATOS DE OBRAS (SEDU/ES) - PAINEL GERAL"
+    ws1["A1"].font = font_title
+    ws1["A1"].alignment = Alignment(vertical="center")
+    ws1.row_dimensions[1].height = 35
+    
+    headers_tab1 = [
+        "Nome do Contrato / Escola",
+        "Próxima Pendência 1 (Mais Urgente)",
+        "Próxima Pendência 2",
+        "Próxima Pendência 3",
+        "Município",
+        "Empresa Executora",
+        "CNPJ Empresa",
+        "Processo Mãe (E-Docs)",
+        "Processo Pagamento",
+        "Valor Atual Contrato (R$)",
+        "Valor Ofertado (R$)",
+        "Valor Base Edital (R$)",
+        "Mês/Ano Data-Base",
+        "Início Vigência",
+        "Término Vigência",
+        "Prazo Limite (4 meses antes)",
+        "Duração (Meses/Dias)",
+        "Tipo de Garantia",
+        "Valor Seguro Garantia (R$)",
+        "Total Aditivos (R$)",
+        "Total Reajustes (R$)",
+        "Equipe de Fiscalização",
+        "Todas as Pendências Ativas"
+    ]
+    
+    ws1.append([])
+    ws1.append(headers_tab1)
+    ws1.row_dimensions[3].height = 28
+    
+    for col_idx in range(1, len(headers_tab1) + 1):
+        cell = ws1.cell(row=3, column=col_idx)
+        cell.font = font_header
+        cell.fill = fill_navy
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border_thin
+        
+    row_idx = 4
+    for c in contracts_list:
+        cid = c['id']
+        c_label = f"{c['contract_number']} - {c['school_name']}"
+        
+        c_tasks = [t for t in contract_tasks_map.get(cid, []) if t.get('status') != 'Concluído']
+        formatted_tasks = []
+        for t in c_tasks:
+            due_str = t.get('due_date') or ""
+            days_left = 999
+            urgency = "BLUE"
+            if due_str:
+                try:
+                    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                        try:
+                            dt = datetime.strptime(due_str.strip(), fmt).date()
+                            days_left = (dt - today_val).days
+                            due_str_br = dt.strftime("%d/%m/%Y")
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        due_str_br = due_str
+                except Exception:
+                    due_str_br = due_str
+                    
+                if days_left <= 30:
+                    urgency = "RED"
+                elif 30 < days_left <= 90:
+                    urgency = "ORANGE"
+                else:
+                    urgency = "BLUE"
+            else:
+                due_str_br = "Sem Prazo"
+                urgency = "BLUE"
+                
+            formatted_tasks.append({
+                'desc': t.get('task_desc', ''),
+                'due': due_str_br,
+                'days_left': days_left,
+                'urgency': urgency,
+                'text': f"{t.get('task_desc', '')} ({due_str_br})"
+            })
+            
+        formatted_tasks.sort(key=lambda x: (0 if x['urgency']=='RED' else (1 if x['urgency']=='ORANGE' else 2), x['days_left']))
+        
+        p1 = formatted_tasks[0] if len(formatted_tasks) > 0 else None
+        p2 = formatted_tasks[1] if len(formatted_tasks) > 1 else None
+        p3 = formatted_tasks[2] if len(formatted_tasks) > 2 else None
+        
+        c_adds = contract_additives_map.get(cid, [])
+        c_reajs = contract_reajustes_map.get(cid, [])
+        tot_adds = sum([(a.get('acrescimo', 0.0) or 0.0) - (a.get('decrescimo', 0.0) or 0.0) for a in c_adds])
+        tot_reajs = sum([r.get('value', 0.0) or 0.0 for r in c_reajs])
+        val_offered = c.get('value_offered') or c.get('value_initial') or 0.0
+        val_contract = c.get('value_contract') or (val_offered + tot_adds + tot_reajs)
+        
+        v_edital = c.get('value_base_bidding') or 0.0
+        if v_edital > 0 and val_offered < (0.85 * v_edital):
+            garantia_val = (0.05 * val_offered) + ((0.85 * v_edital) - val_offered)
+        else:
+            garantia_val = 0.05 * val_offered
+            
+        dur_str = f"{c.get('duration_months',0)}m / {c.get('duration_days',0)}d"
+        c_roles = contract_roles_map.get(cid, [])
+        roles_str = ", ".join([f"{r.get('username','')} ({r.get('role_type','')})" for r in c_roles]) or "Não atribuído"
+        all_p_str = "\n".join([f"• {ft['text']}" for ft in formatted_tasks]) or "Nenhuma pendência ativa."
+        
+        row_vals = [
+            c_label,
+            p1['text'] if p1 else "Nenhuma pendência",
+            p2['text'] if p2 else "",
+            p3['text'] if p3 else "",
+            c.get('city',''),
+            c.get('company_name',''),
+            c.get('company_cnpj',''),
+            c.get('processo_mae',''),
+            c.get('processo_pagamento',''),
+            val_contract,
+            val_offered,
+            v_edital,
+            c.get('date_base',''),
+            c.get('start_date',''),
+            c.get('end_date',''),
+            c.get('due_date',''),
+            dur_str,
+            c.get('warranty_type',''),
+            garantia_val,
+            tot_adds,
+            tot_reajs,
+            roles_str,
+            all_p_str
+        ]
+        
+        ws1.append(row_vals)
+        ws1.row_dimensions[row_idx].height = 24
+        
+        for col_i in range(1, len(row_vals) + 1):
+            cell = ws1.cell(row=row_idx, column=col_i)
+            cell.font = font_normal
+            cell.border = border_thin
+            cell.alignment = Alignment(vertical="center")
+            
+            if col_i in [10, 11, 12, 19, 20, 21]:
+                cell.number_format = 'R$ #,##0.00'
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                
+            if col_i == 2 and p1:
+                cell.fill = fill_red if p1['urgency']=='RED' else (fill_orange if p1['urgency']=='ORANGE' else fill_blue)
+                cell.font = font_red if p1['urgency']=='RED' else (font_orange if p1['urgency']=='ORANGE' else font_blue)
+            elif col_i == 3 and p2:
+                cell.fill = fill_red if p2['urgency']=='RED' else (fill_orange if p2['urgency']=='ORANGE' else fill_blue)
+                cell.font = font_red if p2['urgency']=='RED' else (font_orange if p2['urgency']=='ORANGE' else font_blue)
+            elif col_i == 4 and p3:
+                cell.fill = fill_red if p3['urgency']=='RED' else (fill_orange if p3['urgency']=='ORANGE' else fill_blue)
+                cell.font = font_red if p3['urgency']=='RED' else (font_orange if p3['urgency']=='ORANGE' else font_blue)
+                
+        row_idx += 1
+
+    # -------------------------------------------------------------
+    # ABA 2: Detalhamento por Contrato
+    # -------------------------------------------------------------
+    ws2 = wb.create_sheet(title="Detalhamento por Contrato")
+    ws2.views.sheetView[0].showGridLines = True
+    
+    ws2["A1"] = "📋 DETALHAMENTO INDIVIDUAL DO CONTRATO"
+    ws2["A1"].font = font_title
+    
+    ws2["A2"] = "Selecione o Contrato:"
+    ws2["A2"].font = Font(name="Segoe UI", size=11, bold=True, color="1E3A8A")
+    ws2["A2"].alignment = Alignment(vertical="center")
+    
+    if contract_labels:
+        num_contracts = len(contract_labels)
+        dv_contracts = DataValidation(type="list", formula1=f"='_Dados_Ref'!$A$2:$A${num_contracts+1}", allow_blank=False)
+        ws2.add_data_validation(dv_contracts)
+        ws2["B2"] = contract_labels[0]
+        dv_contracts.add(ws2["B2"])
+        
+    ws2["B2"].font = Font(name="Segoe UI", size=12, bold=True, color="2563EB")
+    ws2["B2"].border = border_thin
+    ws2["B2"].fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+    ws2.row_dimensions[2].height = 28
+    
+    ws2["A4"] = "🚨 1. PENDÊNCIAS DE OBRA E NOTIFICAÇÕES (ORDEM DE URGÊNCIA)"
+    ws2["A4"].font = Font(name="Segoe UI", size=11, bold=True, color="DC2626")
+    ws2["A4"].fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+    ws2.merge_cells("A4:F4")
+    
+    ws2["A5"] = "Lista Completa de Pendências do Contrato Selecionado:"
+    ws2["A5"].font = font_bold
+    
+    ws2["A6"] = "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 31, FALSE)"
+    ws2["A6"].font = Font(name="Segoe UI", size=10, bold=True)
+    ws2["A6"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws2.merge_cells("A6:F9")
+    ws2["A6"].border = border_thin
+    
+    ws2["A11"] = "📋 2. INFORMAÇÕES CADASTRAIS E PROCESSUAIS"
+    ws2["A11"].font = Font(name="Segoe UI", size=11, bold=True, color="1E3A8A")
+    ws2["A11"].fill = PatternFill(start_color="E0F2FE", end_color="E0F2FE", fill_type="solid")
+    ws2.merge_cells("A11:F11")
+    
+    fields_sec2 = [
+        ("Número do Contrato:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 3, FALSE)", "Município:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 5, FALSE)"),
+        ("Escola:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 4, FALSE)", "Empresa Executora:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 6, FALSE)"),
+        ("CNPJ Empresa:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 7, FALSE)", "Contrato Empresa:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 8, FALSE)"),
+        ("Processo Mãe (E-Docs):", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 9, FALSE)", "Processo Pagamento:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 10, FALSE)")
+    ]
+    
+    r_curr = 12
+    for l1, f1, l2, f2 in fields_sec2:
+        ws2.cell(row=r_curr, column=1, value=l1).font = font_bold
+        ws2.cell(row=r_curr, column=2, value=f1).font = font_normal
+        ws2.cell(row=r_curr, column=4, value=l2).font = font_bold
+        ws2.cell(row=r_curr, column=5, value=f2).font = font_normal
+        r_curr += 1
+        
+    r_curr += 1
+    ws2.cell(row=r_curr, column=1, value="💰 3. VALORES, ADITIVOS E REAJUSTES").font = Font(name="Segoe UI", size=11, bold=True, color="166534")
+    ws2.cell(row=r_curr, column=1).fill = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
+    ws2.merge_cells(start_row=r_curr, start_column=1, end_row=r_curr, end_column=6)
+    
+    r_curr += 1
+    fields_sec3 = [
+        ("Valor Ofertado (Proposta):", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 11, FALSE)", "Valor Atual Contrato:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 12, FALSE)"),
+        ("Valor Base Edital:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 13, FALSE)", "Mês/Ano Data-Base:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 14, FALSE)"),
+        ("Total Aditivos (R$):", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 22, FALSE)", "Total Reajustes (R$):", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 23, FALSE)")
+    ]
+    
+    for l1, f1, l2, f2 in fields_sec3:
+        ws2.cell(row=r_curr, column=1, value=l1).font = font_bold
+        c1 = ws2.cell(row=r_curr, column=2, value=f1)
+        c1.font = font_normal
+        if "Valor" in l1 or "Total" in l1:
+            c1.number_format = 'R$ #,##0.00'
+            
+        ws2.cell(row=r_curr, column=4, value=l2).font = font_bold
+        c2 = ws2.cell(row=r_curr, column=5, value=f2)
+        c2.font = font_normal
+        if "Valor" in l2 or "Total" in l2:
+            c2.number_format = 'R$ #,##0.00'
+        r_curr += 1
+        
+    r_curr += 1
+    ws2.cell(row=r_curr, column=1, value="⏱️ 4. VIGÊNCIA, PRAZO LIMITE E SEGURO GARANTIA").font = Font(name="Segoe UI", size=11, bold=True, color="854D0E")
+    ws2.cell(row=r_curr, column=1).fill = PatternFill(start_color="FEF08A", end_color="FEF08A", fill_type="solid")
+    ws2.merge_cells(start_row=r_curr, start_column=1, end_row=r_curr, end_column=6)
+    
+    r_curr += 1
+    fields_sec4 = [
+        ("Início Vigência:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 15, FALSE)", "Término Vigência:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 16, FALSE)"),
+        ("Prazo Limite (4m antes):", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 17, FALSE)", "Duração:", "='_Dados_Ref'!R2C18"),
+        ("Tipo de Garantia:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 20, FALSE)", "Valor Seguro Garantia:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 21, FALSE)"),
+        ("Equipe de Fiscalização:", "=VLOOKUP($B$2, '_Dados_Ref'!$A$2:$AE$500, 24, FALSE)", "", "")
+    ]
+    
+    for l1, f1, l2, f2 in fields_sec4:
+        ws2.cell(row=r_curr, column=1, value=l1).font = font_bold
+        c1 = ws2.cell(row=r_curr, column=2, value=f1)
+        c1.font = font_normal
+        
+        if l2:
+            ws2.cell(row=r_curr, column=4, value=l2).font = font_bold
+            c2 = ws2.cell(row=r_curr, column=5, value=f2)
+            c2.font = font_normal
+            if "Seguro" in l2:
+                c2.number_format = 'R$ #,##0.00'
+        r_curr += 1
+
+    # -------------------------------------------------------------
+    # HELPER SHEET: _Medicoes_Ref
+    # -------------------------------------------------------------
+    ws_m_ref = wb.create_sheet(title="_Medicoes_Ref")
+    ws_m_ref.append(["Key", "Contract_Label", "N_Medicao", "Periodo", "Valor_Medido", "Valor_Reajuste", "Status", "Obs"])
+    
+    for c in contracts_list:
+        cid = c['id']
+        c_label = f"{c['contract_number']} - {c['school_name']}"
+        c_meds = contract_measurements_map.get(cid, [])
+        
+        for m_num in range(1, 13):
+            m_slot = next((m for m in c_meds if m.get('measurement_num') == m_num), None)
+            key_str = f"{c_label}_M{m_num}"
+            if m_slot:
+                ws_m_ref.append([
+                    key_str, c_label, f"{m_num}ª Medição", m_slot.get('date') or f"Mês {m_num}",
+                    m_slot.get('value', 0.0) or 0.0, m_slot.get('value_reajuste', 0.0) or 0.0,
+                    "🟢 Lançado", m_slot.get('obs') or ""
+                ])
+            else:
+                ws_m_ref.append([
+                    key_str, c_label, f"{m_num}ª Medição", "Pendente", 0.0, 0.0, "⚪ Não Lançado", ""
+                ])
+
+    # -------------------------------------------------------------
+    # ABA 3: Medições por Contrato
+    # -------------------------------------------------------------
+    ws3 = wb.create_sheet(title="Medições por Contrato")
+    ws3.views.sheetView[0].showGridLines = True
+    
+    ws3["A1"] = "📏 ACOMPANHAMENTO DE MEDIÇÕES POR CONTRATO"
+    ws3["A1"].font = font_title
+    
+    ws3["A2"] = "Selecione o Contrato:"
+    ws3["A2"].font = Font(name="Segoe UI", size=11, bold=True, color="1E3A8A")
+    
+    if contract_labels:
+        dv_meds = DataValidation(type="list", formula1=f"='_Dados_Ref'!$A$2:$A${len(contract_labels)+1}", allow_blank=False)
+        ws3.add_data_validation(dv_meds)
+        ws3["B2"] = contract_labels[0]
+        dv_meds.add(ws3["B2"])
+        
+    ws3["B2"].font = Font(name="Segoe UI", size=12, bold=True, color="2563EB")
+    ws3["B2"].border = border_thin
+    ws3["B2"].fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+    
+    headers_tab3 = ["Nº Medição", "Mês / Período", "Valor Medido (R$)", "Valor Reajuste na Medição (R$)", "Status", "Observações"]
+    ws3.append([])
+    ws3.append(headers_tab3)
+    ws3.row_dimensions[4].height = 26
+    
+    for col_idx in range(1, len(headers_tab3) + 1):
+        cell = ws3.cell(row=4, column=col_idx)
+        cell.font = font_header
+        cell.fill = fill_blue_header
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border_thin
+        
+    for m_i in range(1, 13):
+        r_num = 4 + m_i
+        ws3.cell(row=r_num, column=1, value=f"{m_i}ª Medição").font = font_bold
+        ws3.cell(row=r_num, column=1).alignment = Alignment(horizontal="center", vertical="center")
+        
+        f_period = f"=VLOOKUP(CONCATENATE($B$2, \"_M{m_i}\"), '_Medicoes_Ref'!$A$2:$H$1000, 4, FALSE)"
+        f_val = f"=VLOOKUP(CONCATENATE($B$2, \"_M{m_i}\"), '_Medicoes_Ref'!$A$2:$H$1000, 5, FALSE)"
+        f_reaj = f"=VLOOKUP(CONCATENATE($B$2, \"_M{m_i}\"), '_Medicoes_Ref'!$A$2:$H$1000, 6, FALSE)"
+        f_status = f"=VLOOKUP(CONCATENATE($B$2, \"_M{m_i}\"), '_Medicoes_Ref'!$A$2:$H$1000, 7, FALSE)"
+        f_obs = f"=VLOOKUP(CONCATENATE($B$2, \"_M{m_i}\"), '_Medicoes_Ref'!$A$2:$H$1000, 8, FALSE)"
+        
+        ws3.cell(row=r_num, column=2, value=f_period).font = font_normal
+        c_v = ws3.cell(row=r_num, column=3, value=f_val)
+        c_v.font = font_normal
+        c_v.number_format = 'R$ #,##0.00'
+        c_v.alignment = Alignment(horizontal="right")
+        
+        c_r = ws3.cell(row=r_num, column=4, value=f_reaj)
+        c_r.font = font_normal
+        c_r.number_format = 'R$ #,##0.00'
+        c_r.alignment = Alignment(horizontal="right")
+        
+        ws3.cell(row=r_num, column=5, value=f_status).font = font_bold
+        ws3.cell(row=r_num, column=5).alignment = Alignment(horizontal="center")
+        ws3.cell(row=r_num, column=6, value=f_obs).font = font_normal
+        
+        for c_idx in range(1, 7):
+            ws3.cell(row=r_num, column=c_idx).border = border_thin
+            
+    tot_row = 17
+    ws3.cell(row=tot_row, column=1, value="TOTAL MEDIDO").font = font_bold
+    ws3.cell(row=tot_row, column=3, value="=SUM(C5:C16)").font = font_bold
+    ws3.cell(row=tot_row, column=3).number_format = 'R$ #,##0.00'
+    ws3.cell(row=tot_row, column=4, value="=SUM(D5:D16)").font = font_bold
+    ws3.cell(row=tot_row, column=4).number_format = 'R$ #,##0.00'
+    
+    for c_idx in range(1, 7):
+        cell = ws3.cell(row=tot_row, column=c_idx)
+        cell.border = border_thin
+        cell.fill = fill_card_header
+
+    # Auto widths
+    for ws in [ws1, ws2, ws3]:
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                if cell.value and not isinstance(cell.value, str) and str(cell.value).startswith("="):
+                    continue
+                val_str = str(cell.value or '')
+                if len(val_str) > max_len and len(val_str) < 60:
+                    max_len = len(val_str)
+            ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
+            
+    ws1.column_dimensions['A'].width = 35
+    ws1.column_dimensions['B'].width = 32
+    ws1.column_dimensions['C'].width = 30
+    ws1.column_dimensions['D'].width = 30
+    ws1.column_dimensions['W'].width = 40
+    
+    ws2.column_dimensions['A'].width = 28
+    ws2.column_dimensions['B'].width = 35
+    ws2.column_dimensions['D'].width = 28
+    ws2.column_dimensions['E'].width = 35
+    
+    ws3.column_dimensions['A'].width = 18
+    ws3.column_dimensions['B'].width = 20
+    ws3.column_dimensions['C'].width = 24
+    ws3.column_dimensions['D'].width = 28
+    ws3.column_dimensions['E'].width = 16
+    ws3.column_dimensions['F'].width = 35
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
     def get_registered_users():
         conn = get_db_connection()
         users = conn.execute("SELECT username, pref_area, email FROM users").fetchall()
@@ -1070,6 +1651,34 @@ if st.session_state['user'] is not None:
         col1.metric("Contratos Monitorados", total_contracts)
         col2.metric("Valor sob Gestão (Atualizado)", f"R$ {total_val:,.2f}")
         col3.metric("Pendências em Aberto", pending_tasks_count)
+        
+        # Botão de Exportação de Planilha Excel Completa (Atualização 38)
+        try:
+            additives_all = conn.execute("SELECT * FROM contract_additives").fetchall()
+            reajustes_all = conn.execute("SELECT * FROM contract_reajustes").fetchall()
+            measurements_all = conn.execute("SELECT * FROM contract_measurements ORDER BY measurement_num").fetchall()
+            roles_all = conn.execute("SELECT * FROM contract_roles").fetchall()
+            history_all = conn.execute("SELECT * FROM contract_history ORDER BY id DESC").fetchall()
+            
+            excel_bytes = generate_excel_report(contracts, tasks, additives_all, reajustes_all, measurements_all, roles_all, history_all)
+            
+            st.markdown("<br/>", unsafe_allow_html=True)
+            col_ex1, col_ex2 = st.columns([3, 1])
+            with col_ex1:
+                st.markdown("##### 📊 Relatório Geral e Fichas de Contratos (Excel .xlsx)")
+                st.caption("Planilha editável em 3 abas contendo o resumo dos contratos, fichas individuais por urgência e acompanhamento de medições.")
+            with col_ex2:
+                st.download_button(
+                    label="📊 Baixar Planilha Excel (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"Gestao_Contratos_SEDU_ES_{date.today().strftime('%d_%m_%Y')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="btn_download_excel_dashboard_v14",
+                    use_container_width=True
+                )
+        except Exception as e_excel:
+            st.caption(f"Nota: Carregamento do relatório Excel disponível após inicialização ({e_excel})")
+
         
         # Carregar Contratos, Tarefas e Notificações com a mesma conexão aberta
         contracts = conn.execute("SELECT * FROM contracts").fetchall()
