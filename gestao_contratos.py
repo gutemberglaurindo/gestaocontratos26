@@ -7,10 +7,14 @@ import json
 import re
 import io
 from datetime import datetime, date, timedelta
-import openpyxl
-from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+try:
+    import openpyxl
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 # Configuração da página do Streamlit
 st.set_page_config(
@@ -1056,6 +1060,9 @@ if st.session_state['user'] is not None:
 
 
 def generate_excel_report(contracts_list, tasks_list, additives_list, reajustes_list, measurements_list, roles_list, history_list):
+    if not HAS_OPENPYXL:
+        st.error("🚨 O pacote 'openpyxl' não está instalado no seu ambiente do Streamlit Cloud. Por favor, atualize o arquivo 'requirements.txt' no GitHub adicionando a linha 'openpyxl'.")
+        return None
     wb = openpyxl.Workbook()
     today_val = date.today()
     
