@@ -1959,13 +1959,22 @@ if st.session_state['user'] is not None:
                     use_container_width=True
                 )
             with col_ex2:
-                py_code_str = code
+                try:
+                    with open(__file__, 'r', encoding='utf-8') as f_code:
+                        py_code_str = f_code.read()
+                except Exception:
+                    try:
+                        with open('gestao_contratos.py', 'r', encoding='utf-8') as f_code:
+                            py_code_str = f_code.read()
+                    except Exception:
+                        py_code_str = "# Gestão de Contratos SEDU/ES\n"
+                
                 st.download_button(
                     label="💻 Baixar Código Fonte App (.py)",
                     data=py_code_str.encode('utf-8'),
                     file_name="gestao_contratos.py",
                     mime="text/x-python",
-                    key="btn_download_py_code_v16",
+                    key="btn_download_py_code_v18",
                     use_container_width=True
                 )
             with col_ex3:
@@ -1974,7 +1983,7 @@ if st.session_state['user'] is not None:
                     data=PROMPT_REPLICACAO_IA_TXT.encode('utf-8'),
                     file_name="prompt_replicacao_ia_gestao_contratos.txt",
                     mime="text/plain",
-                    key="btn_download_prompt_ia_v16",
+                    key="btn_download_prompt_ia_v18",
                     use_container_width=True
                 )
         except Exception as e_excel:
